@@ -1157,13 +1157,6 @@ pthread_t get_socket_thread(int s_id) {
 #undef DEFAULT_LOG
 #define DEFAULT_LOG LOG_SOCKET
 
-#ifdef __APPLE__
-struct mmsghdr {
-    struct msghdr msg_hdr; /* Message header */
-    unsigned int msg_len;  /* Number of bytes transmitted */
-};
-#endif
-
 #if defined(__APPLE__) || defined(__SH4__) || defined(NEEDS_SENDMMSG_SHIM)
 int sendmmsg0(int rsock, struct mmsghdr *msg, int len, int t) {
     int i;
