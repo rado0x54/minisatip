@@ -6,6 +6,19 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+/* macOS doesn't ship `struct mmsghdr` in <sys/socket.h> (it has neither
+ * recvmmsg(2) nor sendmmsg(2)). Define it here so any translation unit
+ * including this header — both socketworks.cpp's writev_udp path and
+ * satipc.cpp's recvmmsg shim — sees the same shape. The recvmmsg /
+ * sendmmsg shims themselves stay where they are.
+ */
+#ifdef __APPLE__
+struct mmsghdr {
+    struct msghdr msg_hdr; /* Message header */
+    unsigned int msg_len;  /* Number of bytes transmitted */
+};
+#endif
+
 typedef int (*socket_action)(void *s);
 typedef int (*read_action)(int, void *, size_t, void *, int *);
 
