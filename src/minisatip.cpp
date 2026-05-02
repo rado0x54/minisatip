@@ -138,6 +138,7 @@ int rtsp, http, si, si1, ssdp1;
 #define SENDALLECM_OPT (LONG_OPT_ONLY_START + 2)
 #define SATIPC_RECV_BUFFER_OPT (LONG_OPT_ONLY_START + 3)
 #define CLIENT_SEND_BUFFER_OPT (LONG_OPT_ONLY_START + 4)
+#define PLUGIN_DIR_OPT (LONG_OPT_ONLY_START + 5)
 
 static const struct option long_options[] = {
     {"adapters", required_argument, NULL, ADAPTERS_OPT},
@@ -148,6 +149,7 @@ static const struct option long_options[] = {
     {"bind-http", required_argument, NULL, BIND_HTTP_OPT},
     {"bind-dev", required_argument, NULL, BIND_DEV_OPT},
     {"cache-dir", required_argument, NULL, CACHE_DIR_OPT},
+    {"plugin-dir", required_argument, NULL, PLUGIN_DIR_OPT},
     {"send-all-ecm", no_argument, NULL, SENDALLECM_OPT},
     {"client-send-buffer", required_argument, NULL, CLIENT_SEND_BUFFER_OPT},
     {"delsys", required_argument, NULL, DELSYS_OPT},
@@ -326,6 +328,11 @@ Help\n\
 \n\
 * -z --cache-dir dir : set the app cache directory to dir. The directory will be created if it doesn't exist. \n\
 	* defaults to /var/cache/minisatip (/var/lib/minisatip on Enigma) \n\
+\n\
+* --plugin-dir dir : load adapter-plugin shared libraries (.so / .dylib) from dir at startup. \n\
+	* each plugin must export the symbol minisatip_plugin_register; see src/adapter_plugin.h. \n\
+	* default: feature off (no scanning). \n\
+	* used to provide tuner backends on platforms without /dev/dvb/* (macOS, Synology DSM 7+, …). \n\
 \n\
 * -d --diseqc ADAPTER1:COMMITTED1-UNCOMMITTED1[,ADAPTER2:COMMITTED2-UNCOMMITTED2[,...]\n\
 \t* The first argument is the adapter number, second is the number of committed packets to send to a Diseqc 1.0 switch, third the number of uncommitted commands to sent to a Diseqc 1.1 switch\n\
@@ -1031,6 +1038,9 @@ void set_options(int argc, char *argv[]) {
 
         case CACHE_DIR_OPT:
             opts.cache_dir = optarg;
+            break;
+        case PLUGIN_DIR_OPT:
+            opts.plugin_dir = optarg;
             break;
 
         case DROP_ENCRYPTED_OPT:

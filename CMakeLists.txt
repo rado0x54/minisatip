@@ -171,6 +171,7 @@ set(MINISATIP_SOURCES
     src/socketworks.cpp
     src/stream.cpp
     src/adapter.cpp
+    src/adapter_plugin.cpp
     src/httpc.cpp
     src/opts.cpp
     src/utils.cpp
@@ -187,6 +188,12 @@ set(MINISATIP_SOURCES
     src/dvbapi.cpp
     src/satipc.cpp
 )
+
+# Plugin loader needs libdl for dlopen. glibc folds it into libc since
+# 2.34, but listing it explicitly is harmless and keeps older Linux,
+# *BSD, and macOS happy. (DVBCA already pulls dl in; this guarantees
+# it for builds where DVBCA is off.)
+list(APPEND MINISATIP_LIBS dl)
 
 if(DVBCSA)
     list(APPEND MINISATIP_SOURCES src/csa.cpp)
@@ -239,6 +246,19 @@ if(STATIC)
     # Add atomic library for static MIPS builds
     if(CMAKE_CXX_COMPILER_TARGET MATCHES "mipsel")
         list(APPEND MINISATIP_LIBS atomic)
+    endif()
+endif()
+
+# Export dynamic so dlopen'd adapter plugins can resolve back into
+# minisatip's symbols (adapter_alloc, LOG, ...). On macOS this is the
+# default for executables, so the flag is a no-op there but harmless.
+# On Linux it's required: without -rdynamic, plugins see only libc
+# symbols and would need every internal call routed through a vtable.
+if(NOT STATIC)
+    if(APPLE)
+        target_link_options(minisatip PRIVATE -Wl,-export_dynamic)
+    else()
+        target_link_options(minisatip PRIVATE -rdynamic)
     endif()
 endif()
 

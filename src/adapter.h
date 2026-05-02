@@ -164,6 +164,13 @@ int init_all_hw();
 int getAdaptersCount();
 adapter *adapter_alloc();
 int close_adapter(int na);
+
+/* Adapter-plugin loader (src/adapter_plugin.cpp). load_plugin_adapters
+ * is called once from find_adapters() in adapter.cpp; it dlopens
+ * shared libraries from opts.plugin_dir and lets each plugin populate
+ * adapter slots. unload_plugin_adapters tears them down at clean exit. */
+int load_plugin_adapters(adapter **a);
+void unload_plugin_adapters(void);
 int get_free_adapter(transponder *tp);
 int set_adapter_for_stream(int sid, int aid);
 void close_adapter_for_stream(int sid, int aid, int close_stream);
