@@ -79,6 +79,7 @@ option(CXX23 "Enable C++23 features (stacktrace)" ${CXX23_DEFAULT})
 option(STATIC "Build with static linking" OFF)
 option(DEBUG "Enable debug/sanitizer build" OFF)
 option(SRT "Enable SRT support" ${SRT_DEFAULT})
+option(PLUGINS "Enable adapter-plugin loader (dlopen vendor backends)" ON)
 option(BUILD_TESTING "Build tests" OFF)
 
 # Platform detection
@@ -171,7 +172,6 @@ set(MINISATIP_SOURCES
     src/socketworks.cpp
     src/stream.cpp
     src/adapter.cpp
-    src/adapter_plugin.cpp
     src/httpc.cpp
     src/opts.cpp
     src/utils.cpp
@@ -189,11 +189,13 @@ set(MINISATIP_SOURCES
     src/satipc.cpp
 )
 
-# Plugin loader needs libdl for dlopen. glibc folds it into libc since
-# 2.34, but listing it explicitly is harmless and keeps older Linux,
-# *BSD, and macOS happy. (DVBCA already pulls dl in; this guarantees
-# it for builds where DVBCA is off.)
-list(APPEND MINISATIP_LIBS dl)
+if(PLUGINS)
+    list(APPEND MINISATIP_SOURCES src/adapter_plugin.cpp)
+    # Plugin loader needs libdl for dlopen. glibc folds it into libc
+    # since 2.34, but listing it explicitly keeps older Linux, *BSD,
+    # and macOS happy.
+    list(APPEND MINISATIP_LIBS dl)
+endif()
 
 if(DVBCSA)
     list(APPEND MINISATIP_SOURCES src/csa.cpp)
@@ -250,16 +252,21 @@ if(STATIC)
 endif()
 
 # Export dynamic so dlopen'd adapter plugins can resolve back into
-# minisatip's symbols (adapter_alloc, LOG, ...). On macOS this is the
-# default for executables, so the flag is a no-op there but harmless.
-# On Linux it's required: without -rdynamic, plugins see only libc
-# symbols and would need every internal call routed through a vtable.
-if(NOT STATIC)
+# minisatip's symbols (adapter_alloc, LOG, opts, thread_index/info, ...).
+# On macOS this is the default for executables, so the flag is a no-op
+# there but harmless. On Linux it's required: without -rdynamic, plugins
+# see only libc symbols and would need every internal call routed through
+# a vtable. Skip both when plugins are compiled out.
+if(PLUGINS AND NOT STATIC)
     if(APPLE)
         target_link_options(minisatip PRIVATE -Wl,-export_dynamic)
     else()
         target_link_options(minisatip PRIVATE -rdynamic)
     endif()
+endif()
+
+if(NOT PLUGINS)
+    target_compile_definitions(minisatip_lib PRIVATE DISABLE_PLUGINS)
 endif()
 
 target_link_libraries(minisatip PRIVATE ${MINISATIP_LIBS})

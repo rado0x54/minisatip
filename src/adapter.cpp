@@ -137,10 +137,13 @@ void find_adapters() {
 #ifndef DISABLE_DDCI
     find_ddci_adapter(a);
 #endif
+#ifndef DISABLE_PLUGINS
     /* Adapter-plugin loader. Scans opts.plugin_dir if set, dlopens
      * each .so/.dylib, and lets the plugin populate slots in `a`.
-     * No-op if --plugin-dir wasn't given. See src/adapter_plugin.cpp. */
+     * No-op if --plugin-dir wasn't given. See src/adapter_plugin.cpp.
+     * Compile out with -DDISABLE_PLUGINS for static-only builds. */
     load_plugin_adapters(a);
+#endif
 }
 
 // avoid adapter close unless all the adapters can be closed
@@ -1428,9 +1431,11 @@ void free_all_adapters() {
         LOG("Netceiver exit failed");
 #endif
 
+#ifndef DISABLE_PLUGINS
     /* Plugins go after all adapter free()s — adapter free() callbacks
      * may live in plugin code that's about to be dlclose'd. */
     unload_plugin_adapters();
+#endif
 }
 char is_adapter_disabled(int i) {
     if (i >= 0 && i < MAX_ADAPTERS)

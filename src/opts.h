@@ -80,9 +80,11 @@ typedef struct struct_opts {
     char pmt_scan;
     char emulate_pids_all;
     const char *cache_dir;
+#ifndef DISABLE_PLUGINS
     /* Directory scanned at startup for adapter-plugin shared libraries.
      * NULL or empty disables plugin loading. Set via --plugin-dir DIR. */
     const char *plugin_dir;
+#endif
 } struct_opts_t;
 
 void parse_dvbapi_opt(char *optarg, struct_opts_t *optz);

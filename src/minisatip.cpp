@@ -138,7 +138,9 @@ int rtsp, http, si, si1, ssdp1;
 #define SENDALLECM_OPT (LONG_OPT_ONLY_START + 2)
 #define SATIPC_RECV_BUFFER_OPT (LONG_OPT_ONLY_START + 3)
 #define CLIENT_SEND_BUFFER_OPT (LONG_OPT_ONLY_START + 4)
+#ifndef DISABLE_PLUGINS
 #define PLUGIN_DIR_OPT (LONG_OPT_ONLY_START + 5)
+#endif
 
 static const struct option long_options[] = {
     {"adapters", required_argument, NULL, ADAPTERS_OPT},
@@ -149,7 +151,9 @@ static const struct option long_options[] = {
     {"bind-http", required_argument, NULL, BIND_HTTP_OPT},
     {"bind-dev", required_argument, NULL, BIND_DEV_OPT},
     {"cache-dir", required_argument, NULL, CACHE_DIR_OPT},
+#ifndef DISABLE_PLUGINS
     {"plugin-dir", required_argument, NULL, PLUGIN_DIR_OPT},
+#endif
     {"send-all-ecm", no_argument, NULL, SENDALLECM_OPT},
     {"client-send-buffer", required_argument, NULL, CLIENT_SEND_BUFFER_OPT},
     {"delsys", required_argument, NULL, DELSYS_OPT},
@@ -1039,9 +1043,11 @@ void set_options(int argc, char *argv[]) {
         case CACHE_DIR_OPT:
             opts.cache_dir = optarg;
             break;
+#ifndef DISABLE_PLUGINS
         case PLUGIN_DIR_OPT:
             opts.plugin_dir = optarg;
             break;
+#endif
 
         case DROP_ENCRYPTED_OPT:
             opts.drop_encrypted =
