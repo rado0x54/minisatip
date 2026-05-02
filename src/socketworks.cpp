@@ -30,13 +30,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <sys/prctl.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 #include "minisatip.h"
 #include "socketworks.h"
@@ -664,7 +669,11 @@ void *select_and_execute(void *arg) {
            sizeof(thread_info[thread_index].thread_name));
     if (arg) {
         safe_strncpy(thread_info[thread_index].thread_name, (char *)arg);
+#ifdef __linux__
         prctl(PR_SET_NAME, thread_info[thread_index].thread_name, 0, 0, 0);
+#elif defined(__APPLE__)
+        pthread_setname_np(thread_info[thread_index].thread_name);
+#endif
     } else
         strcpy(thread_info[thread_index].thread_name, "main");
 
