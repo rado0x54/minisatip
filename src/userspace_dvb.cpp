@@ -242,15 +242,24 @@ int dvb_socket_read(int sock, void *buf, size_t len, sockets *ss, int *rv) {
     char drain[64];
     while (read(sock, drain, sizeof(drain)) > 0) { /* discard */ }
 
+    /* Return semantics, important to get right: minisatip's
+     * select_and_execute() treats a 0 return as "read failed" and,
+     * when the byte count is also 0, falls past the EAGAIN retry
+     * counter and calls sockets_del() — i.e. our adapter's DVR fd
+     * gets torn down for what should be a benign inter-transfer
+     * gap. So whenever there's no actual error we return 1 (success)
+     * with *rv = 0; the loop then sees rlen == 0, doesn't update
+     * rtime, doesn't run the master action, and waits for the next
+     * wake on the engine's event fd. */
     adapter_state *st = state_for_fd(sock);
     if (!st || !st->handle) {
-        *rv = 0; errno = EAGAIN; return 0;
+        *rv = 0; return 1;
     }
     st->calls_since_log++;
 
     size_t dst_cap = (len / TS_PACKET) * TS_PACKET;
     if (dst_cap == 0) {
-        *rv = 0; errno = EAGAIN; return 0;
+        *rv = 0; return 1;
     }
 
     uint8_t *dst       = static_cast<uint8_t *>(buf);
@@ -271,9 +280,6 @@ int dvb_socket_read(int sock, void *buf, size_t len, sockets *ss, int *rv) {
         }
     }
     maybe_log_rate(st);
-    if (bytes_out == 0) {
-        *rv = 0; errno = EAGAIN; return 0;
-    }
     *rv = static_cast<int>(bytes_out);
     return 1;
 }
