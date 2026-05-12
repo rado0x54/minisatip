@@ -17,8 +17,7 @@ on:
   workflow_dispatch:
 
 env:
-  # Pin to a tag once rado0x54/dvb-libusb has one; until then, main.
-  DVB_LIBUSB_REF: main
+  DVB_LIBUSB_REF: v0.1.1
   LIBUSB_VERSION: "1.0.27"
 
 jobs:
