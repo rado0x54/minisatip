@@ -79,6 +79,7 @@ option(CXX23 "Enable C++23 features (stacktrace)" ${CXX23_DEFAULT})
 option(STATIC "Build with static linking" OFF)
 option(DEBUG "Enable debug/sanitizer build" OFF)
 option(SRT "Enable SRT support" ${SRT_DEFAULT})
+option(USERSPACE_DVB "Enable userspace DVB driver via dvb-libusb (statically linked)" OFF)
 option(BUILD_TESTING "Build tests" OFF)
 
 # Platform detection
@@ -101,7 +102,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Generate config.h
-set(OPTIONS DVBCSA DVBCA NETCVCLIENT LINUXDVB DDCI CXX23 SRT)
+set(OPTIONS DVBCSA DVBCA NETCVCLIENT LINUXDVB DDCI CXX23 SRT USERSPACE_DVB)
 set(CONFIG_CONTENT "// Auto-generated configuration header\n#ifndef CONFIG_H\n#define CONFIG_H\n\n")
 
 foreach(OPT ${OPTIONS})
@@ -207,6 +208,22 @@ if(SRT)
     list(APPEND MINISATIP_SOURCES src/srt.cpp)
     list(APPEND MINISATIP_LIBS srt)
 endif()
+if(USERSPACE_DVB)
+    # Two ways to provide dvb-libusb:
+    #   1. -DDVB_LIBUSB_SOURCE_DIR=/path/to/dvb-libusb (dev iteration:
+    #      add_subdirectory directly, no install step required)
+    #   2. installed CMake config package found on CMAKE_PREFIX_PATH
+    #      (production / CI / cross-compile: build dvb-libusb once per
+    #      target arch, install to a per-arch prefix, then point
+    #      minisatip's configure at the same prefix)
+    if(DVB_LIBUSB_SOURCE_DIR)
+        add_subdirectory(${DVB_LIBUSB_SOURCE_DIR} dvb_libusb_build EXCLUDE_FROM_ALL)
+    else()
+        find_package(dvb_libusb CONFIG REQUIRED)
+    endif()
+    list(APPEND MINISATIP_SOURCES src/userspace_dvb.cpp)
+    list(APPEND MINISATIP_LIBS dvb_libusb::dvb_libusb)
+endif()
 if(NOT APPLE)
     list(APPEND MINISATIP_LIBS rt)
 endif()
@@ -220,6 +237,13 @@ target_include_directories(minisatip_lib PUBLIC
 target_compile_options(minisatip_lib PRIVATE -include ${CMAKE_BINARY_DIR}/config.h)
 if(SRT)
     target_include_directories(minisatip_lib PUBLIC ${SRT_INCLUDE_DIR})
+endif()
+if(USERSPACE_DVB)
+    # Propagate dvb_libusb's INTERFACE include dirs (its public headers
+    # like <dvb_handle/...>, <dvb_em28xx/...>) to the OBJECT lib so
+    # userspace_dvb.cpp compiles. The executable's link step pulls the
+    # archive via MINISATIP_LIBS; this is just compile-side resolution.
+    target_link_libraries(minisatip_lib PRIVATE dvb_libusb::dvb_libusb)
 endif()
 if(STDCPPEXP_LIBRARY)
     target_link_libraries(minisatip_lib PRIVATE ${STDCPPEXP_LIBRARY})
