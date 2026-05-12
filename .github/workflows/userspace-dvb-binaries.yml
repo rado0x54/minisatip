@@ -83,6 +83,19 @@ jobs:
           make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
           make install
 
+      - name: Force static-only brew prefixes (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Apple's ld has no -static flag, so we coerce static linking
+          # by removing the .dylib/.tbd siblings from each brew prefix
+          # we depend on. With only .a left in the prefix the linker
+          # has nothing else to pick. Safe because runners are
+          # ephemeral. openssl@3 is keg-only so its dylibs live under
+          # opt/openssl@3 rather than /opt/homebrew/lib.
+          for prefix in $(brew --prefix libusb) $(brew --prefix srt) $(brew --prefix openssl@3); do
+            rm -fv "$prefix"/lib/*.dylib "$prefix"/lib/*.tbd 2>/dev/null || true
+          done
+
       - name: Check out dvb-libusb
         uses: actions/checkout@v4
         with:
@@ -98,47 +111,39 @@ jobs:
       - name: Configure minisatip (Linux)
         if: runner.os == 'Linux'
         run: |
-          # DVBCSA_LIBRARY is overridden directly to the from-source
-          # build (the apt libdvbcsa-dev variant lacks ICAM). CRYPTO
-          # and SRT auto-detect from apt's -dev packages; -DSTATIC=ON
-          # makes -static handle the .a preference at link time for
-          # those. NETCVCLIENT stays off (libnetceiver not packaged
-          # in apt).
+          # -DSTATIC=ON makes -static handle .a preference at link
+          # time for every -l<lib> (libdvbcsa from our scratch prefix
+          # via -L; libcrypto/libsrt/libusb from apt's -dev packages).
+          # NETCVCLIENT stays off (libnetceiver not packaged in apt).
           cmake -B build \
             -DUSERSPACE_DVB=ON \
             -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
             -DDVBCSA=ON \
-            -DDVBCSA_LIBRARY="$GITHUB_WORKSPACE/libdvbcsa-install/lib/libdvbcsa.a" \
             -DCMAKE_C_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
             -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
+            -DCMAKE_EXE_LINKER_FLAGS="-L$GITHUB_WORKSPACE/libdvbcsa-install/lib" \
             -DSTATIC=ON -DLINUXDVB=ON -DNETCVCLIENT=OFF
 
       - name: Configure minisatip (macOS)
         if: runner.os == 'macOS'
         run: |
-          # macOS has no `-static` linker flag, so each lib is pinned
-          # to its static archive by full path: DVBCSA + SRT via
-          # *_LIBRARY cache variables, openssl via linker flags (for
-          # libsrt.a's transitives), libusb via dvb-libusb's
-          # DVB_LIBUSB_PREFER_LIBUSB_STATIC option which has dvb-libusb
-          # swap its imported pkg-config target to libusb-1.0.a. The
-          # CMakeLists patch ('link DVBCSA/CRYPTO/SRT via cache var
-          # paths') is what makes the *_LIBRARY overrides take effect.
-          # libdvbcsa headers aren't in the default include path on
-          # Apple Silicon, hence CMAKE_CXX_FLAGS. NETCVCLIENT/LINUXDVB/
-          # DVBCA are off on Apple (force-disabled by CMakeLists).
+          # macOS has no -static linker flag — handled instead by the
+          # rm-dylib step above that leaves only .a archives in each
+          # brew prefix we depend on. Bare -l<lib> link references
+          # then resolve naturally to .a. -L flags point at our
+          # scratch libdvbcsa prefix and at brew's keg-only openssl@3
+          # (libsrt.a has transitive openssl symbol references).
+          # NETCVCLIENT/LINUXDVB/DVBCA are off on Apple (force-
+          # disabled by CMakeLists).
           cmake -B build \
             -DUSERSPACE_DVB=ON \
             -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
-            -DDVB_LIBUSB_PREFER_LIBUSB_STATIC=ON \
             -DLINUXDVB=OFF -DNETCVCLIENT=OFF \
-            -DDVBCSA=ON \
-            -DDVBCSA_LIBRARY="$GITHUB_WORKSPACE/libdvbcsa-install/lib/libdvbcsa.a" \
-            -DSRT=ON \
-            -DSRT_LIBRARY="$(brew --prefix srt)/lib/libsrt.a" \
+            -DDVBCSA=ON -DSRT=ON \
             -DSRT_INCLUDE_DIR="$(brew --prefix srt)/include" \
+            -DCMAKE_C_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
             -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
-            -DCMAKE_EXE_LINKER_FLAGS="$(brew --prefix openssl@3)/lib/libssl.a $(brew --prefix openssl@3)/lib/libcrypto.a"
+            -DCMAKE_EXE_LINKER_FLAGS="-L$GITHUB_WORKSPACE/libdvbcsa-install/lib -L$(brew --prefix openssl@3)/lib"
 
       - name: Build minisatip
         run: |
