@@ -36,6 +36,9 @@
 #include "dvb.h"
 #include "dvbapi.h"
 #include "pmt.h"
+#ifndef DISABLE_USERSPACE_DVB
+#include "userspace_dvb.h"
+#endif
 #include "socketworks.h"
 #include "stream.h"
 #include "utils.h"
@@ -136,6 +139,9 @@ void find_adapters() {
 #endif
 #ifndef DISABLE_DDCI
     find_ddci_adapter(a);
+#endif
+#ifndef DISABLE_USERSPACE_DVB
+    find_userspace_dvb_adapter(a);
 #endif
 }
 
@@ -1422,6 +1428,12 @@ void free_all_adapters() {
     fprintf(stderr, "\n\nREEL: recv_exit\n");
     if (opts.netcv_if && recv_exit())
         LOG("Netceiver exit failed");
+#endif
+
+#ifndef DISABLE_USERSPACE_DVB
+    /* Engines tear down USB devices; must run after every adapter's
+     * free() has fired so capture_stop has already been issued. */
+    userspace_dvb_shutdown();
 #endif
 }
 char is_adapter_disabled(int i) {
