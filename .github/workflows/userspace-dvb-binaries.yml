@@ -132,21 +132,22 @@ jobs:
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/libusb-install/lib/pkgconfig
         run: |
-          # -DSTATIC=ON handles .a preference for every -l<lib>:
-          # libdvbcsa from our scratch prefix via -L, libcrypto/libsrt
-          # from apt -dev packages, libusb from our from-source prefix
-          # via PKG_CONFIG_PATH. -lcrypto -ldl appended at the end
-          # gives the linker a second pass to resolve libsrt.a's
-          # transitive openssl symbols (left-to-right scan otherwise
-          # misses them when libsrt is scanned after libcrypto).
+          # SRT is off on Linux for now: Ubuntu's libsrt-openssl-dev
+          # references AES_wrap_key/AES_unwrap_key, which OpenSSL 3.x's
+          # libcrypto.a no longer exports (moved to the legacy provider
+          # that isn't pulled in statically). Re-enable once we either
+          # build openssl+libsrt from source (catalinii style) or
+          # Ubuntu's libsrt-openssl-dev gets rebuilt to not need those.
+          # macOS keeps SRT enabled — brew's openssl@3 + libsrt are
+          # built against each other compatibly.
           cmake -B build \
             -DUSERSPACE_DVB=ON \
             -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
             -DDVBCSA=ON \
             -DCMAKE_C_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
             -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
-            -DCMAKE_EXE_LINKER_FLAGS="-L$GITHUB_WORKSPACE/libdvbcsa-install/lib -lcrypto -ldl" \
-            -DSTATIC=ON -DLINUXDVB=ON -DNETCVCLIENT=OFF
+            -DCMAKE_EXE_LINKER_FLAGS="-L$GITHUB_WORKSPACE/libdvbcsa-install/lib" \
+            -DSTATIC=ON -DLINUXDVB=ON -DNETCVCLIENT=OFF -DSRT=OFF
 
       - name: Configure minisatip (macOS)
         if: runner.os == 'macOS'
