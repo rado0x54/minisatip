@@ -19,6 +19,7 @@ on:
 env:
   # Pin to a tag once rado0x54/dvb-libusb has one; until then, main.
   DVB_LIBUSB_REF: main
+  LIBUSB_VERSION: "1.0.27"
 
 jobs:
   build:
@@ -41,17 +42,17 @@ jobs:
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
         run: |
-          # libdvbcsa is built from source below (we need the ICAM
-          # extension; the apt libdvbcsa-dev package doesn't carry the
-          # extension and historically may or may not ship .a anyway).
-          # libusb-1.0-0-dev, libssl-dev, libsrt-openssl-dev all ship
-          # .a archives; CMAKE_FIND_LIBRARY_SUFFIXES=.a below makes
-          # find_library prefer them.
+          # libdvbcsa + libusb are built from source below:
+          #   - libdvbcsa needs the ICAM extension from catalinii's fork
+          #   - libusb has to be built --disable-udev because Ubuntu's
+          #     libusb-1.0-0-dev links libusb against libudev which
+          #     isn't shipped as a .a (only .so), breaking -static.
+          # libssl-dev, libsrt-openssl-dev ship .a archives that
+          # -static picks up cleanly.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config zip ca-certificates \
-            autoconf libtool automake \
-            libusb-1.0-0-dev libudev-dev \
+            wget tar bzip2 autoconf libtool automake \
             libssl-dev libsrt-openssl-dev
 
       - name: Install build deps (macOS)
@@ -64,6 +65,24 @@ jobs:
           # the .dylib sits beside it.
           brew install --quiet cmake pkg-config autoconf libtool automake wget \
             libusb srt openssl@3
+
+      - name: Build libusb-1.0 static (Linux, --disable-udev)
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          # Ubuntu's apt libusb-1.0-0-dev compiles libusb with udev
+          # support, which means libusb-1.0.a has unresolved -ludev
+          # references — and Ubuntu doesn't ship libudev.a. Building
+          # libusb ourselves with --disable-udev sidesteps the whole
+          # chain. We don't use libusb hotplug, so the loss is moot.
+          wget -q "https://github.com/libusb/libusb/releases/download/v${LIBUSB_VERSION}/libusb-${LIBUSB_VERSION}.tar.bz2"
+          tar xf "libusb-${LIBUSB_VERSION}.tar.bz2"
+          cd "libusb-${LIBUSB_VERSION}"
+          ./configure \
+            --disable-shared --enable-static --disable-udev \
+            --prefix="$GITHUB_WORKSPACE/libusb-install"
+          make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+          make install
 
       - name: Build libdvbcsa (with ICAM) from source
         run: |
@@ -110,24 +129,23 @@ jobs:
 
       - name: Configure minisatip (Linux)
         if: runner.os == 'Linux'
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/libusb-install/lib/pkgconfig
         run: |
-          # -DSTATIC=ON makes -static handle .a preference at link
-          # time for every -l<lib> (libdvbcsa from our scratch prefix
-          # via -L; libcrypto/libsrt from apt's -dev packages).
-          # libusb is a separate case: dvb-libusb consumes it via
-          # pkg_check_modules + IMPORTED_TARGET, which CMake resolves
-          # to a full libusb-1.0.so path that bypasses -static.
-          # DVB_LIBUSB_PREFER_LIBUSB_STATIC=ON makes dvb-libusb swap
-          # the imported target's link to libusb-1.0.a explicitly.
-          # NETCVCLIENT stays off (libnetceiver not packaged in apt).
+          # -DSTATIC=ON handles .a preference for every -l<lib>:
+          # libdvbcsa from our scratch prefix via -L, libcrypto/libsrt
+          # from apt -dev packages, libusb from our from-source prefix
+          # via PKG_CONFIG_PATH. -lcrypto -ldl appended at the end
+          # gives the linker a second pass to resolve libsrt.a's
+          # transitive openssl symbols (left-to-right scan otherwise
+          # misses them when libsrt is scanned after libcrypto).
           cmake -B build \
             -DUSERSPACE_DVB=ON \
             -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
-            -DDVB_LIBUSB_PREFER_LIBUSB_STATIC=ON \
             -DDVBCSA=ON \
             -DCMAKE_C_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
             -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
-            -DCMAKE_EXE_LINKER_FLAGS="-L$GITHUB_WORKSPACE/libdvbcsa-install/lib -lcrypto -ldl -ludev -lpthread -lm" \
+            -DCMAKE_EXE_LINKER_FLAGS="-L$GITHUB_WORKSPACE/libdvbcsa-install/lib -lcrypto -ldl" \
             -DSTATIC=ON -DLINUXDVB=ON -DNETCVCLIENT=OFF
 
       - name: Configure minisatip (macOS)
