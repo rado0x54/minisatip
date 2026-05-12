@@ -1,0 +1,194 @@
+name: Userspace DVB Binaries
+
+# Cross-platform static binaries with USERSPACE_DVB=ON. Targets Apple
+# Silicon plus the x86_64 and aarch64 Synology model families. Each
+# job builds libusb-1.0 statically from source so the resulting binary
+# has no third-party shared-lib runtime dependencies — libudev is
+# disabled on Linux (libusb still enumerates without it; hotplug just
+# becomes unavailable, which we don't use), and on macOS libusb talks
+# to IOKit directly so udev is moot.
+
+on:
+  push:
+    branches: [ master, userspace-dvb-support ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+env:
+  # Pin to a tag once rado0x54/dvb-libusb has one; until then, main.
+  DVB_LIBUSB_REF: main
+  LIBUSB_VERSION: "1.0.27"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            arch: aarch64-linux
+          - runner: macos-14
+            arch: arm64-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config wget tar bzip2 \
+            autoconf libtool zip ca-certificates \
+            libssl-dev libdvbcsa-dev libsrt-openssl-dev
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # libdvbcsa is built from source below (we need the ICAM
+          # extension, which isn't in the brew formula). srt + openssl
+          # come from brew and we'll link their static archives by
+          # full path — brew's `.dylib` siblings stay untouched but
+          # find_library / direct -DSRT_LIBRARY override picks the .a.
+          brew install --quiet cmake pkg-config autoconf libtool automake wget \
+            srt openssl@3
+
+      - name: Build libusb-1.0 static
+        run: |
+          set -eux
+          wget -q "https://github.com/libusb/libusb/releases/download/v${LIBUSB_VERSION}/libusb-${LIBUSB_VERSION}.tar.bz2"
+          tar xf "libusb-${LIBUSB_VERSION}.tar.bz2"
+          cd "libusb-${LIBUSB_VERSION}"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            EXTRA_CONFIGURE="--disable-udev"
+          else
+            EXTRA_CONFIGURE=""
+          fi
+          ./configure \
+            --disable-shared --enable-static \
+            $EXTRA_CONFIGURE \
+            --prefix="$GITHUB_WORKSPACE/libusb-install"
+          make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+          make install
+
+      - name: Build libdvbcsa (with ICAM) from source (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -eux
+          # catalinii/libdvbcsa carries the ICAM extension that
+          # minisatip's src/csa.cpp probes for via a weak symbol.
+          # Static linking on macOS doesn't honor weak attribute, so
+          # we must build a libdvbcsa.a that actually exports
+          # dvbcsa_bs_key_set_ecm.
+          git clone --depth 1 https://github.com/catalinii/libdvbcsa.git libdvbcsa-src
+          cd libdvbcsa-src
+          autoreconf -fi
+          ./configure \
+            --disable-shared --enable-static \
+            --prefix="$GITHUB_WORKSPACE/libdvbcsa-install"
+          make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+          make install
+
+      - name: Check out dvb-libusb
+        uses: actions/checkout@v4
+        with:
+          repository: rado0x54/dvb-libusb
+          ref: ${{ env.DVB_LIBUSB_REF }}
+          path: dvb-libusb
+
+      - name: Fetch lifted chip-driver sources
+        run: |
+          cd dvb-libusb
+          bash scripts/fetch-lifted.sh
+
+      - name: Configure minisatip (Linux)
+        if: runner.os == 'Linux'
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/libusb-install/lib/pkgconfig
+        run: |
+          # -DSTATIC=ON makes the linker prefer .a over .so for every
+          # dep — the apt -dev packages we installed ship both. The
+          # bare-name link (-ldvbcsa etc.) resolves to .a in this mode.
+          # NETCVCLIENT stays off — libnetceiver isn't packaged in apt.
+          cmake -B build \
+            -DUSERSPACE_DVB=ON \
+            -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
+            -DSTATIC=ON -DLINUXDVB=ON -DNETCVCLIENT=OFF
+
+      - name: Configure minisatip (macOS)
+        if: runner.os == 'macOS'
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/libusb-install/lib/pkgconfig
+        run: |
+          # macOS has no `-static` linker flag, so we force individual
+          # static archives by passing their full paths via the
+          # *_LIBRARY cache variables. The CMakeLists patch from the
+          # prep commit ('link DVBCSA/CRYPTO/SRT via cache var paths')
+          # is what makes those overrides actually take effect on the
+          # link line. libdvbcsa headers aren't in the default macOS
+          # compiler include path, hence CMAKE_CXX_FLAGS. OpenSSL is
+          # only needed transitively by libsrt.a — passed via
+          # CMAKE_EXE_LINKER_FLAGS so it lands at the end of the link
+          # line where libsrt.a's unresolved openssl symbols can find
+          # it. NETCVCLIENT / LINUXDVB / DVBCA are off on Apple
+          # (CMakeLists force-disables those for Apple regardless).
+          cmake -B build \
+            -DUSERSPACE_DVB=ON \
+            -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
+            -DLINUXDVB=OFF -DNETCVCLIENT=OFF \
+            -DDVBCSA=ON \
+            -DDVBCSA_LIBRARY="$GITHUB_WORKSPACE/libdvbcsa-install/lib/libdvbcsa.a" \
+            -DSRT=ON \
+            -DSRT_LIBRARY="$(brew --prefix srt)/lib/libsrt.a" \
+            -DSRT_INCLUDE_DIR="$(brew --prefix srt)/include" \
+            -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
+            -DCMAKE_EXE_LINKER_FLAGS="$(brew --prefix openssl@3)/lib/libssl.a $(brew --prefix openssl@3)/lib/libcrypto.a"
+
+      - name: Build minisatip
+        run: |
+          cmake --build build -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+
+      - name: Verify binary
+        run: |
+          file build/minisatip
+          ./build/minisatip --version || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          ZIP_NAME="minisatip-userspace-dvb-${{ matrix.arch }}.zip"
+          # Bundle the binary plus the html/ web-UI directory.
+          zip -9 -r "dist/$ZIP_NAME" build/minisatip html
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minisatip-userspace-dvb-${{ matrix.arch }}
+          path: dist/*.zip
+
+  release:
+    needs: build
+    # Only publish a release when a tag is pushed on this fork.
+    # Upstream's existing release job keeps doing its own thing.
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository_owner == 'rado0x54'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: artifacts/*.zip
+          file_glob: true
+          tag: ${{ github.ref_name }}
+          overwrite: true
