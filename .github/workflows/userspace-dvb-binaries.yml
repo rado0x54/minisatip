@@ -41,14 +41,18 @@ jobs:
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
         run: |
-          # libusb-1.0-0-dev ships both libusb-1.0.so and libusb-1.0.a;
-          # -DSTATIC=ON below makes the linker prefer the .a. No need
-          # to build libusb from source.
+          # libdvbcsa is built from source below (we need the ICAM
+          # extension; the apt libdvbcsa-dev package doesn't carry the
+          # extension and historically may or may not ship .a anyway).
+          # libusb-1.0-0-dev, libssl-dev, libsrt-openssl-dev all ship
+          # .a archives; CMAKE_FIND_LIBRARY_SUFFIXES=.a below makes
+          # find_library prefer them.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config zip ca-certificates \
+            autoconf libtool automake \
             libusb-1.0-0-dev libudev-dev \
-            libssl-dev libdvbcsa-dev libsrt-openssl-dev
+            libssl-dev libsrt-openssl-dev
 
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
@@ -61,15 +65,15 @@ jobs:
           brew install --quiet cmake pkg-config autoconf libtool automake wget \
             libusb srt openssl@3
 
-      - name: Build libdvbcsa (with ICAM) from source (macOS only)
-        if: runner.os == 'macOS'
+      - name: Build libdvbcsa (with ICAM) from source
         run: |
           set -eux
           # catalinii/libdvbcsa carries the ICAM extension that
           # minisatip's src/csa.cpp probes for via a weak symbol.
-          # Static linking on macOS doesn't honor weak attribute, so
-          # we must build a libdvbcsa.a that actually exports
-          # dvbcsa_bs_key_set_ecm.
+          # Building from source on all platforms gives both the ICAM
+          # symbol and a guaranteed libdvbcsa.a — the apt package on
+          # Linux may not always ship the static archive, and the brew
+          # formula on macOS doesn't carry the ICAM extension either.
           git clone --depth 1 https://github.com/catalinii/libdvbcsa.git libdvbcsa-src
           cd libdvbcsa-src
           autoreconf -fi
@@ -94,13 +98,19 @@ jobs:
       - name: Configure minisatip (Linux)
         if: runner.os == 'Linux'
         run: |
-          # -DSTATIC=ON makes the linker prefer .a over .so for every
-          # dep — apt's -dev packages ship both. NETCVCLIENT stays
-          # off (libnetceiver not packaged). DVBCSA/DVBCA/SRT
-          # auto-detect from the dev packages.
+          # DVBCSA_LIBRARY is overridden directly to the from-source
+          # build (the apt libdvbcsa-dev variant lacks ICAM). CRYPTO
+          # and SRT auto-detect from apt's -dev packages; -DSTATIC=ON
+          # makes -static handle the .a preference at link time for
+          # those. NETCVCLIENT stays off (libnetceiver not packaged
+          # in apt).
           cmake -B build \
             -DUSERSPACE_DVB=ON \
             -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
+            -DDVBCSA=ON \
+            -DDVBCSA_LIBRARY="$GITHUB_WORKSPACE/libdvbcsa-install/lib/libdvbcsa.a" \
+            -DCMAKE_C_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
+            -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
             -DSTATIC=ON -DLINUXDVB=ON -DNETCVCLIENT=OFF
 
       - name: Configure minisatip (macOS)
