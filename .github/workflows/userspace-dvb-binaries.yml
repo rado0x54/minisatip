@@ -182,10 +182,55 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p dist
+          mkdir -p dist firmware
+          cat > firmware/README.txt <<'EOF'
+          Userspace DVB firmware directory
+          ================================
+
+          Drop DVB chip-driver firmware blobs into this directory, then
+          run minisatip with FIRMWARE_DIR pointed at it:
+
+              FIRMWARE_DIR="$PWD/firmware" ./minisatip ...
+
+          Commonly required firmware files (per supported chip family):
+
+            dvb-usb-dib0700-1.20.fw       — dib0700 bridge (most older
+                                            Hauppauge / Pinnacle USB DVB
+                                            sticks built around DiB0700)
+            dvb-demod-si2168-b40-01.fw    — Si2168 demod (Hauppauge
+                                            WinTV-dualHD DVB variant)
+            dvb-demod-mn88472-02.fw       — MN88472 demod (Microsoft Xbox
+                                            One Digital TV Tuner)
+
+          Where to obtain them:
+
+            * linux-firmware (canonical source):
+              https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/
+              Each blob lives at a path like
+              https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/<filename>
+
+            * Debian / Ubuntu: `apt install firmware-linux-nonfree`
+              (files end up under /lib/firmware)
+
+            * Any Linux box that has DVB stuff installed already:
+              /lib/firmware/ usually carries them
+
+          Alternative locations minisatip probes automatically (in order)
+          if FIRMWARE_DIR is unset:
+
+            /usr/local/share/minisatip/firmware
+            /usr/local/lib/firmware
+            /usr/lib/firmware
+            /lib/firmware
+
+          So if you copy the blobs into one of those system paths, you
+          can omit FIRMWARE_DIR entirely.
+          EOF
           ZIP_NAME="minisatip-userspace-dvb-${{ matrix.arch }}.zip"
-          # Bundle the binary plus the html/ web-UI directory.
-          zip -9 -r "dist/$ZIP_NAME" build/minisatip html
+          # Bundle the binary, the html/ web-UI directory, and an
+          # empty (README-only) firmware/ dir so end users have a
+          # clear drop-in spot for chip-driver firmware blobs.
+          zip -9 -r "dist/$ZIP_NAME" build/minisatip html firmware
 
       - uses: actions/upload-artifact@v7
         with:
