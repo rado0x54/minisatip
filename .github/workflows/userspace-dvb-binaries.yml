@@ -19,7 +19,6 @@ on:
 env:
   # Pin to a tag once rado0x54/dvb-libusb has one; until then, main.
   DVB_LIBUSB_REF: main
-  LIBUSB_VERSION: "1.0.27"
 
 jobs:
   build:
@@ -42,40 +41,25 @@ jobs:
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
         run: |
+          # libusb-1.0-0-dev ships both libusb-1.0.so and libusb-1.0.a;
+          # -DSTATIC=ON below makes the linker prefer the .a. No need
+          # to build libusb from source.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config wget tar bzip2 \
-            autoconf libtool zip ca-certificates \
+            build-essential cmake pkg-config zip ca-certificates \
+            libusb-1.0-0-dev libudev-dev \
             libssl-dev libdvbcsa-dev libsrt-openssl-dev
 
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
         run: |
           # libdvbcsa is built from source below (we need the ICAM
-          # extension, which isn't in the brew formula). srt + openssl
-          # come from brew and we'll link their static archives by
-          # full path — brew's `.dylib` siblings stay untouched but
-          # find_library / direct -DSRT_LIBRARY override picks the .a.
+          # extension, not in the brew formula). libusb + srt + openssl
+          # come from brew; dvb-libusb's DVB_LIBUSB_PREFER_LIBUSB_STATIC
+          # option below forces libusb to resolve to its .a even though
+          # the .dylib sits beside it.
           brew install --quiet cmake pkg-config autoconf libtool automake wget \
-            srt openssl@3
-
-      - name: Build libusb-1.0 static
-        run: |
-          set -eux
-          wget -q "https://github.com/libusb/libusb/releases/download/v${LIBUSB_VERSION}/libusb-${LIBUSB_VERSION}.tar.bz2"
-          tar xf "libusb-${LIBUSB_VERSION}.tar.bz2"
-          cd "libusb-${LIBUSB_VERSION}"
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            EXTRA_CONFIGURE="--disable-udev"
-          else
-            EXTRA_CONFIGURE=""
-          fi
-          ./configure \
-            --disable-shared --enable-static \
-            $EXTRA_CONFIGURE \
-            --prefix="$GITHUB_WORKSPACE/libusb-install"
-          make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-          make install
+            libusb srt openssl@3
 
       - name: Build libdvbcsa (with ICAM) from source (macOS only)
         if: runner.os == 'macOS'
@@ -109,13 +93,11 @@ jobs:
 
       - name: Configure minisatip (Linux)
         if: runner.os == 'Linux'
-        env:
-          PKG_CONFIG_PATH: ${{ github.workspace }}/libusb-install/lib/pkgconfig
         run: |
           # -DSTATIC=ON makes the linker prefer .a over .so for every
-          # dep — the apt -dev packages we installed ship both. The
-          # bare-name link (-ldvbcsa etc.) resolves to .a in this mode.
-          # NETCVCLIENT stays off — libnetceiver isn't packaged in apt.
+          # dep — apt's -dev packages ship both. NETCVCLIENT stays
+          # off (libnetceiver not packaged). DVBCSA/DVBCA/SRT
+          # auto-detect from the dev packages.
           cmake -B build \
             -DUSERSPACE_DVB=ON \
             -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
@@ -123,24 +105,22 @@ jobs:
 
       - name: Configure minisatip (macOS)
         if: runner.os == 'macOS'
-        env:
-          PKG_CONFIG_PATH: ${{ github.workspace }}/libusb-install/lib/pkgconfig
         run: |
-          # macOS has no `-static` linker flag, so we force individual
-          # static archives by passing their full paths via the
-          # *_LIBRARY cache variables. The CMakeLists patch from the
-          # prep commit ('link DVBCSA/CRYPTO/SRT via cache var paths')
-          # is what makes those overrides actually take effect on the
-          # link line. libdvbcsa headers aren't in the default macOS
-          # compiler include path, hence CMAKE_CXX_FLAGS. OpenSSL is
-          # only needed transitively by libsrt.a — passed via
-          # CMAKE_EXE_LINKER_FLAGS so it lands at the end of the link
-          # line where libsrt.a's unresolved openssl symbols can find
-          # it. NETCVCLIENT / LINUXDVB / DVBCA are off on Apple
-          # (CMakeLists force-disables those for Apple regardless).
+          # macOS has no `-static` linker flag, so each lib is pinned
+          # to its static archive by full path: DVBCSA + SRT via
+          # *_LIBRARY cache variables, openssl via linker flags (for
+          # libsrt.a's transitives), libusb via dvb-libusb's
+          # DVB_LIBUSB_PREFER_LIBUSB_STATIC option which has dvb-libusb
+          # swap its imported pkg-config target to libusb-1.0.a. The
+          # CMakeLists patch ('link DVBCSA/CRYPTO/SRT via cache var
+          # paths') is what makes the *_LIBRARY overrides take effect.
+          # libdvbcsa headers aren't in the default include path on
+          # Apple Silicon, hence CMAKE_CXX_FLAGS. NETCVCLIENT/LINUXDVB/
+          # DVBCA are off on Apple (force-disabled by CMakeLists).
           cmake -B build \
             -DUSERSPACE_DVB=ON \
             -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
+            -DDVB_LIBUSB_PREFER_LIBUSB_STATIC=ON \
             -DLINUXDVB=OFF -DNETCVCLIENT=OFF \
             -DDVBCSA=ON \
             -DDVBCSA_LIBRARY="$GITHUB_WORKSPACE/libdvbcsa-install/lib/libdvbcsa.a" \
