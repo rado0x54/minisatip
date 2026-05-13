@@ -12,3 +12,6 @@ src/confdefs.h
 .vscode
 autom4te.cache
 build/test
+
+# Local sample/test playlists dropped into the document root — not shipped.
+html/*.m3u
