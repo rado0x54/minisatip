@@ -72,14 +72,22 @@ static uint32_t hdhr_crc32(const uint8_t *buf, int len) {
     return crc ^ 0xFFFFFFFF;
 }
 
+// Count physical adapter slots (frontends) — the right HDHR TunerCount.
+// getAdaptersCount() sums per-delivery-system counters, so a dual-FE
+// adapter that supports two delsys (e.g. WinTV-dualHD: DVB-T2 + DVB-C
+// on each of its 2 FEs) would inflate to 4. Walking a[] gives the actual
+// number of concurrent streams the device can serve.
 static int active_tuner_count(void) {
     if (opts.hdhr_tuners > 0)
         return opts.hdhr_tuners;
-    int n = getAdaptersCount();
+    int n = 0;
+    for (int i = 0; i < MAX_ADAPTERS; i++)
+        if (a[i])
+            n++;
     if (n < 1)
         n = 1;
-    if (n > 8)
-        n = 8;
+    if (n > 16)
+        n = 16;
     return n;
 }
 
