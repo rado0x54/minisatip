@@ -80,6 +80,12 @@ typedef struct struct_opts {
     char pmt_scan;
     char emulate_pids_all;
     const char *cache_dir;
+#ifndef DISABLE_HDHOMERUN
+    char *hdhr_channels;   // M3U path (NULL = feature disabled at runtime)
+    char *hdhr_name;       // friendly name advertised to clients
+    int hdhr_tuners;       // 0 = auto from enabled adapter count
+    time_t hdhr_m3u_mtime; // mtime cache key for hot reload
+#endif
 } struct_opts_t;
 
 void parse_dvbapi_opt(char *optarg, struct_opts_t *optz);

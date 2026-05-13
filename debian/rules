@@ -3,6 +3,9 @@
 %:
 	dh $@ --with vdrplugin
 
+override_dh_auto_configure:
+	dh_auto_configure -- -DHDHOMERUN=ON
+
 execute_after_override_dh_install:
 	chmod 644 debian/minisatip/usr/share/minisatip/html/status.html
 

@@ -143,6 +143,7 @@ jobs:
             -DUSERSPACE_DVB=ON \
             -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
             -DDVBCSA=ON \
+            -DHDHOMERUN=ON \
             -DCMAKE_C_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
             -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
             -DCMAKE_EXE_LINKER_FLAGS="-L$GITHUB_WORKSPACE/libdvbcsa-install/lib" \
@@ -166,6 +167,7 @@ jobs:
             -DDVB_LIBUSB_SOURCE_DIR="$PWD/dvb-libusb" \
             -DLINUXDVB=OFF -DNETCVCLIENT=OFF \
             -DDVBCSA=ON -DSRT=ON \
+            -DHDHOMERUN=ON \
             -DSRT_INCLUDE_DIR="$(brew --prefix srt)/include" \
             -DCMAKE_C_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \
             -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/libdvbcsa-install/include" \

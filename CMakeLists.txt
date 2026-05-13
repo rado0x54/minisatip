@@ -80,6 +80,7 @@ option(STATIC "Build with static linking" OFF)
 option(DEBUG "Enable debug/sanitizer build" OFF)
 option(SRT "Enable SRT support" ${SRT_DEFAULT})
 option(USERSPACE_DVB "Enable userspace DVB driver via dvb-libusb (statically linked)" OFF)
+option(HDHOMERUN "Enable HDHomeRun tuner emulation" OFF)
 option(BUILD_TESTING "Build tests" OFF)
 
 # Platform detection
@@ -102,7 +103,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Generate config.h
-set(OPTIONS DVBCSA DVBCA NETCVCLIENT LINUXDVB DDCI CXX23 SRT USERSPACE_DVB)
+set(OPTIONS DVBCSA DVBCA NETCVCLIENT LINUXDVB DDCI CXX23 SRT USERSPACE_DVB HDHOMERUN)
 set(CONFIG_CONTENT "// Auto-generated configuration header\n#ifndef CONFIG_H\n#define CONFIG_H\n\n")
 
 foreach(OPT ${OPTIONS})
@@ -224,6 +225,9 @@ if(USERSPACE_DVB)
     list(APPEND MINISATIP_SOURCES src/userspace_dvb.cpp)
     list(APPEND MINISATIP_LIBS dvb_libusb::dvb_libusb)
 endif()
+if(HDHOMERUN)
+    list(APPEND MINISATIP_SOURCES src/hdhomerun.cpp)
+endif()
 if(NOT APPLE)
     list(APPEND MINISATIP_LIBS rt)
 endif()
@@ -305,6 +309,7 @@ if(BUILD_TESTING)
     # Re-use MINISATIP_SOURCES and adjust for tests
     set(TEST_MAIN_SOURCES ${MINISATIP_SOURCES})
     list(REMOVE_ITEM TEST_MAIN_SOURCES src/netceiver.cpp)
+    list(REMOVE_ITEM TEST_MAIN_SOURCES src/hdhomerun.cpp)
     list(APPEND TEST_MAIN_SOURCES src/ca.cpp src/aes.cpp src/ddci.cpp)
     if(DVBCSA_LIBRARY)
         list(APPEND TEST_MAIN_SOURCES src/csa.cpp)
@@ -323,6 +328,7 @@ if(BUILD_TESTING)
         DDCI_TEST
         DISABLE_STACKTRACE
         DISABLE_NETCVCLIENT
+        DISABLE_HDHOMERUN
         VERSION="test"
     )
     if(NOT DVBCSA_LIBRARY)
@@ -347,6 +353,7 @@ if(BUILD_TESTING)
             DDCI_TEST
             DISABLE_STACKTRACE
             DISABLE_NETCVCLIENT
+            DISABLE_HDHOMERUN
             VERSION="test"
         )
         if(NOT DVBCSA_LIBRARY)

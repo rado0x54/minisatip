@@ -28,6 +28,10 @@
 #include "srt.h"
 #include "stream.h"
 
+#ifndef DISABLE_HDHOMERUN
+#include "hdhomerun.h"
+#endif
+
 #include "utils/ticks.h"
 #include "utils/uuid.h"
 
@@ -138,6 +142,9 @@ int rtsp, http, si, si1, ssdp1;
 #define SENDALLECM_OPT (LONG_OPT_ONLY_START + 2)
 #define SATIPC_RECV_BUFFER_OPT (LONG_OPT_ONLY_START + 3)
 #define CLIENT_SEND_BUFFER_OPT (LONG_OPT_ONLY_START + 4)
+#define HDHR_CHANNELS_OPT (LONG_OPT_ONLY_START + 5)
+#define HDHR_NAME_OPT (LONG_OPT_ONLY_START + 6)
+#define HDHR_TUNERS_OPT (LONG_OPT_ONLY_START + 7)
 
 static const struct option long_options[] = {
     {"adapters", required_argument, NULL, ADAPTERS_OPT},
@@ -207,6 +214,11 @@ static const struct option long_options[] = {
     {"ci", required_argument, NULL, FORCE_CI_OPT},
     {"ca-channels", required_argument, NULL, CA_CHANNELS_OPT},
 #endif
+#ifndef DISABLE_HDHOMERUN
+    {"hdhomerun-channels", required_argument, NULL, HDHR_CHANNELS_OPT},
+    {"hdhomerun-name", required_argument, NULL, HDHR_NAME_OPT},
+    {"hdhomerun-tuners", required_argument, NULL, HDHR_TUNERS_OPT},
+#endif
 
     {0, 0, 0, 0}};
 
@@ -260,6 +272,11 @@ const char *built_info[] = {
     "Built without srt",
 #else
     "Built with srt",
+#endif
+#ifdef DISABLE_HDHOMERUN
+    "Built without hdhomerun emulation",
+#else
+    "Built with hdhomerun emulation",
 #endif
     NULL};
 
@@ -542,6 +559,16 @@ Help\n\
 * -9 --disable-pmt-scan: Disables scanning PMTs and only reads the PMTs that are requested by the client\n\
 \t* Provides more reliable decrypting for channels included in multiple providers\n\
 \n"
+#ifndef DISABLE_HDHOMERUN
+        "\
+* --hdhomerun-channels <path>: enable HDHomeRun tuner emulation, channels read from an M3U file\n\
+\t* The M3U lists channels as #EXTINF:0,<name> followed by a minisatip URL on the next line\n\
+\t* Exposes /discover.json /lineup.json /lineup_status.json /device.xml and UDP discovery on 65001\n\
+\t* Stream URLs in the lineup are rewritten per request using the client's Host: header\n\
+* --hdhomerun-name <name>: friendly name advertised to HDHomeRun clients (default: minisatip)\n\
+* --hdhomerun-tuners <n>: number of concurrent tuners to advertise (default: auto from enabled adapters)\n\
+\n"
+#endif
 #ifndef DISABLE_DVBCA
         "\
 * -3 --ca-pin mapping_string: set the pin for CIs\n\
@@ -671,6 +698,13 @@ void set_options(int argc, char *argv[]) {
     opts.max_pids = 0;
     opts.dvbapi_offset =
         0; // offset for multiple dvbapi clients to the same server
+
+#ifndef DISABLE_HDHOMERUN
+    opts.hdhr_channels = NULL;
+    opts.hdhr_name = (char *)"minisatip";
+    opts.hdhr_tuners = 0; // 0 = auto from adapter count
+    opts.hdhr_m3u_mtime = 0;
+#endif
 
     opts.name_app = app_name;
     char short_opts[200];
@@ -1077,6 +1111,17 @@ void set_options(int argc, char *argv[]) {
             break;
 
 #endif
+#ifndef DISABLE_HDHOMERUN
+        case HDHR_CHANNELS_OPT:
+            opts.hdhr_channels = optarg;
+            break;
+        case HDHR_NAME_OPT:
+            opts.hdhr_name = optarg;
+            break;
+        case HDHR_TUNERS_OPT:
+            opts.hdhr_tuners = atoi(optarg);
+            break;
+#endif
         }
     }
 
@@ -1385,6 +1430,7 @@ int read_http(sockets *s) {
     char ra[50];
     char *space;
     int is_head = 0;
+    int la = 0;
     static const char *xml =
         "<?xml version=\"1.0\"?>"
         "<root xmlns=\"urn:schemas-upnp-org:device-1-0\" configId=\"1\">"
@@ -1478,7 +1524,7 @@ int read_http(sockets *s) {
         s->sid, s->sock, log_buf ? "\n" : "",
         log_buf ? (const char *)s->buf : "");
 
-    split(arg, (char *)s->buf, ARRAY_SIZE(arg), ' ');
+    la = split(arg, (char *)s->buf, ARRAY_SIZE(arg), ' ');
     //      LOG("args: %s -> %s -> %s",arg[0],arg[1],arg[2]);
     if (strncmp(arg[0], "GET", 3) && strncmp(arg[0], "POST", 4) && !is_head)
         REPLY_AND_RETURN(503);
@@ -1552,6 +1598,11 @@ int read_http(sockets *s) {
         free(buf);
         return 0;
     }
+
+#ifndef DISABLE_HDHOMERUN
+    if (opts.hdhr_channels && hdhr_handle_http(s, arg, la))
+        return 0;
+#endif
 
     // process file from html directory, the images are just sent back
 
@@ -1884,6 +1935,21 @@ int main(int argc, char *argv[]) {
         if (si < 0 || si1 < 0)
             FAIL("sockets_add failed for ssdp");
     }
+
+#ifndef DISABLE_HDHOMERUN
+    if (opts.hdhr_channels) {
+        if (hdhr_init() < 0)
+            FAIL("HDHR: init failed (could not load %s)", opts.hdhr_channels);
+        int hdhr_sock =
+            udp_bind(opts.bind, HDHR_DISCOVERY_PORT, opts.use_ipv4_only);
+        if (hdhr_sock < 1)
+            FAIL("HDHR: could not bind on udp port %d", HDHR_DISCOVERY_PORT);
+        if (0 > sockets_add(hdhr_sock, NULL, -1, TYPE_UDP,
+                            (socket_action)hdhr_udp_reply, NULL, NULL))
+            FAIL("HDHR: sockets_add failed");
+        LOG("HDHR: discovery listening on udp/%d", HDHR_DISCOVERY_PORT);
+    }
+#endif
 
 #ifndef DISABLE_SRT
     srt_startup();
