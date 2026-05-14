@@ -3,6 +3,23 @@
        src="https://scan.coverity.com/projects/23090/badge.svg"/>
 </a>
 
+> [!IMPORTANT]
+> **About this fork**
+>
+> This is a fork of [catalinii/minisatip](https://github.com/catalinii/minisatip) that adds two capabilities on top of upstream:
+>
+> - **Userspace USB DVB driver** — talks to supported USB DVB tuners (em28xx, dib0700, dvbsky bridges; e.g. WinTV-dualHD, MyGica T230C, Xbox One DTV Tuner) directly through [`dvb-libusb`](https://github.com/rado0x54/dvb-libusb), with no kernel DVB module required. Useful on macOS and on Linux systems whose stock kernel ships without DVB support (e.g. Synology DSM and other appliance NAS distributions). Also supports **USB hotplug** — devices plugged in or removed at runtime are auto-registered / torn down. Enable with `-DUSERSPACE_DVB=ON`.
+> - **HDHomeRun tuner emulation** — exposes minisatip's tuners over the SiliconDust HDHomeRun discovery + HTTP-streaming protocol, so HDHR-native clients (Plex, Channels, etc.) can use any backend minisatip supports. Enable with `-DHDHOMERUN=ON` and `-p PLAYLIST`.
+>
+> Releases on this fork include prebuilt Linux/macOS binaries with both features enabled. Everything else is upstream minisatip — the SAT>IP server, DVB-T/T2/C/S/S2/ATSC support, dvbapi/dvbca, web UI — and tracks the upstream branches.
+>
+> On macOS the easiest install is via Homebrew:
+>
+> ```sh
+> brew install rado0x54/tap/minisatip
+> brew services start minisatip   # runs as a launchd service on ports 9080 (UI) / 9554 (RTSP)
+> ```
+
 # Welcome to Minisatip
 
 Minisatip is a multi-threaded satip server version 1.2 that runs under Linux and it was tested with DVB-S, DVB-S2, DVB-T, DVB-T2, DVB-C, DVB-C2, ATSC and ISDB-T cards. More details about supported hardware: https://github.com/catalinii/minisatip/blob/master/Supported_Hardware.md
