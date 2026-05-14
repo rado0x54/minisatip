@@ -403,8 +403,15 @@
 				if (state['ad_type'][i] == 0)
 					continue;
 
+				// ad_present is provided when the backend tracks physical
+				// presence (e.g. USB hotplug). Missing => legacy backend,
+				// treat as present.
+				var ad_present = ('ad_present' in state) ? state['ad_present'][i] : 1;
+
 				if (state['ad_enabled'][i] == 1)
 					myTable += "<tr valign='top'>";
+				else if (!ad_present)
+					myTable += "<tr style='opacity: 0.35; text-decoration: line-through;'>";
 				else
 					myTable += "<tr style='opacity: 0.5;'>";
 
@@ -457,6 +464,8 @@
 				if (!ad_enabled) {
 					if (ad_disabled)
 						signal = "<small>DISABLED</small>";
+					else if (!ad_present)
+						signal = "<small>DEPARTED</small>";
 					else
 						signal = "<small>OFFLINE</small>";
 				} else if (ad_type == 4) {

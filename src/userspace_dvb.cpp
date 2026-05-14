@@ -37,6 +37,7 @@
 #include "dvb_em28xx/dvb_em28xx.h"
 #include "dvb_dib0700/dvb_dib0700.h"
 #include "dvb_dvbsky/dvb_dvbsky.h"
+#include "dvb_hotplug/dvb_hotplug.h"
 #include <linuxdvbkpi/firmware_root.h>
 
 #include <cerrno>
@@ -44,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <pthread.h>
 #include <string>
 #include <time.h>
@@ -69,6 +71,24 @@ struct adapter_state {
     dvb_frontend_handle_t *handle;          /* set at find_*_adapter */
     int                    dvr_fd;          /* engine's wake fd; -1 */
 
+    /* Slot identity preserved across unplug/replug so the worker can
+     * route a re-arrival of the same board back to this g_state slot
+     * (and therefore the same SAT>IP adapter number). Set on first
+     * fill; never cleared while a[i] for this fn is allocated. */
+    dvb_hotplug_bridge_t   bridge;
+    uint16_t               vid;
+    uint16_t               pid;
+
+    /* "device actually departed" flag, set by the LEFT handler or by
+     * dvb_socket_read on read_ts -ENODEV. dvb_close reads it to
+     * decide whether to clear ad->sys[]:
+     *   true  → real unplug, drop delsys so SAT>IP tuner count
+     *           updates and get_free_adapter stops picking this slot
+     *   false → idle-timeout close with USB still plugged in, keep
+     *           sys[] so the next RTSP SETUP can on-demand re-open
+     *           via init_hw (adapter.cpp:738). */
+    bool                   engine_dead;
+
     /* TS resync state. Touched only from dvb_socket_read. */
     uint8_t               *stage;           /* malloc'd TS_STAGE_SIZE */
     size_t                 stage_len;
@@ -83,6 +103,23 @@ struct adapter_state {
 
 adapter_state g_state[MAX_ADAPTERS];
 int           g_state_count = 0;
+
+/* Lock ordering: a_mutex -> ad->mutex -> g_state_mutex. g_state_mutex
+ * MUST NOT be held when calling adapter_register / adapter_find_by_fn /
+ * init_hw / close_adapter. Take it briefly to read or publish g_state[];
+ * release before dispatching into adapter.cpp. */
+SMutex g_state_mutex;
+
+int hotplug_pipe_rd = -1;
+int hotplug_pipe_wr = -1;
+bool hotplug_active = false;
+
+/* Count of in-flight ARRIVED worker threads. Incremented under
+ * g_state_mutex by handle_arrived before pthread_create; decremented
+ * by hotplug_worker on exit. userspace_dvb_shutdown drains this with
+ * a bounded wait so workers stop touching g_state / a[] before we
+ * tear the engines down. */
+int g_workers_in_flight = 0;
 
 adapter_state *state_for(adapter *ad) {
     if (!ad || ad->fn < 0 || ad->fn >= MAX_ADAPTERS) return nullptr;
@@ -278,7 +315,31 @@ int dvb_socket_read(int sock, void *buf, size_t len, sockets *ss, int *rv) {
         int got = st->handle->ops->read_ts(st->handle->engine_state,
                                            st->stage + st->stage_len,
                                            headroom, /*timeout_ms=*/0);
-        if (got <= 0) break;
+        if (got == -ENODEV) {
+            /* Device is gone: usbq returns -ENODEV when stopping is
+             * set and the ring is drained. Mark the slot so dvb_close
+             * knows to clear ad->sys[], then surface to the event
+             * loop: read_ok=0 + rlen=0 falls through socketworks'
+             * error path to sockets_del -> close_adapter. */
+            LOG("read_ts on %s returned -ENODEV - device gone, tearing down",
+                st->handle->display_name);
+            {
+                std::lock_guard<SMutex> lk(g_state_mutex);
+                st->engine_dead = true;
+            }
+            *rv = 0;
+            return 0;
+        }
+        if (got < 0) {
+            /* Other negative — unknown / transient. Log once per call,
+             * treat as "no data this iteration"; do NOT tear the slot
+             * down (avoid silent disappearance on a buggy bridge or a
+             * future error code we don't recognize yet). */
+            LOG("read_ts on %s returned unexpected %d - treating as transient",
+                st->handle->display_name, got);
+            break;
+        }
+        if (got == 0) break;
         st->stage_len += static_cast<size_t>(got);
         if (!st->first_chunk_logged) {
             st->first_chunk_logged = true;
@@ -354,7 +415,17 @@ int dvb_post_init(adapter *ad) {
 int dvb_close(adapter *ad) {
     adapter_state *st = state_for(ad);
     if (!st) return 0;
-    if (st->handle && st->handle->ops->capture_stop) {
+
+    /* Read the "device actually gone" flag up front so we can also
+     * skip capture_stop on a dead USB device (the control transfer
+     * would time out rather than respond). */
+    bool dead;
+    {
+        std::lock_guard<SMutex> lk(g_state_mutex);
+        dead = st->engine_dead;
+    }
+
+    if (!dead && st->handle && st->handle->ops->capture_stop) {
         pthread_mutex_lock(st->handle->bridge_lock);
         st->handle->ops->capture_stop(st->handle->engine_state);
         pthread_mutex_unlock(st->handle->bridge_lock);
@@ -365,10 +436,36 @@ int dvb_close(adapter *ad) {
     st->stage_len          = 0;
     st->ts_locked          = false;
     st->first_chunk_logged = false;
+
+    {
+        std::lock_guard<SMutex> lk(g_state_mutex);
+        st->engine_dead = false;
+        /* Only release the handle on real departure. Idle-timeout
+         * closes keep handle alive so the next get_free_adapter ->
+         * init_hw -> dvb_open succeeds — this is the lazy-adapter
+         * pattern the rest of minisatip uses. */
+        if (dead) st->handle = nullptr;
+    }
+
+    if (dead) {
+        /* Real unplug: drop delsys so the slot stops being advertised
+         * (getAdaptersCount counts on delsys_match) and
+         * get_free_adapter (adapter.cpp:738) stops picking this slot
+         * to re-open. The next ARRIVED runs init_hw which
+         * re-populates sys[] via ad->delsys (adapter.cpp:300-301). */
+        memset(ad->sys, 0, sizeof(ad->sys));
+    }
     return 0;
 }
 
 void dvb_free(adapter *ad) { (void)ad; }
+
+int dvb_is_present(adapter *ad) {
+    adapter_state *st = state_for(ad);
+    if (!st) return 0;
+    std::lock_guard<SMutex> lk(g_state_mutex);
+    return st->handle != nullptr ? 1 : 0;
+}
 
 int dvb_set_pid(adapter *ad, int pid) { return ad->id * 1000 + pid; }
 int dvb_del_filters(adapter *ad, int fd, int pid) {
@@ -506,6 +603,272 @@ void populate_one(adapter *ad, int handle_index) {
     ad->tune        = dvb_tune;
     ad->delsys      = dvb_delsys;
     ad->name        = dvb_name;
+    ad->is_present  = dvb_is_present;
+}
+
+/* ---- Hotplug plumbing ------------------------------------------- *
+ *
+ * Slot assignment policy:
+ *   A g_state slot's (bridge, vid, pid) is sticky for the process
+ *   lifetime once first populated. On a LEFT, st->handle is cleared
+ *   but the identity stays; the next ARRIVED for the same
+ *   (bridge, vid, pid) reuses this slot, keeping the SAT>IP adapter
+ *   number stable across re-plugs of the same board model. */
+
+/* Resolve (bus, devaddr) -> (vid, pid) for a startup-discovered handle
+ * by scanning the bridge's present-USB list. The discover_all path
+ * doesn't expose VID:PID directly; scan_present is libusb-only (no
+ * device claim) and cheap. */
+int scan_bridge_vidpid(dvb_hotplug_bridge_t bridge,
+                       uint8_t bus, uint8_t devaddr,
+                       uint16_t *vid_out, uint16_t *pid_out) {
+    dvb_present_board_t entries[MAX_ADAPTERS] = {};
+    int n = 0;
+    switch (bridge) {
+        case DVB_HOTPLUG_BRIDGE_EM28XX:
+            n = dvb_em28xx_scan_present (entries, MAX_ADAPTERS); break;
+        case DVB_HOTPLUG_BRIDGE_DIB0700:
+            n = dvb_dib0700_scan_present(entries, MAX_ADAPTERS); break;
+        case DVB_HOTPLUG_BRIDGE_DVBSKY:
+            n = dvb_dvbsky_scan_present (entries, MAX_ADAPTERS); break;
+        default: return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        if (entries[i].bus_number == bus &&
+            entries[i].device_address == devaddr) {
+            unsigned v = 0, p = 0;
+            if (sscanf(entries[i].vidpid, "%x:%x", &v, &p) != 2) return -1;
+            *vid_out = static_cast<uint16_t>(v);
+            *pid_out = static_cast<uint16_t>(p);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Publish a single dvb_frontend_handle_t as an adapter. Reuses any
+ * matching free slot (same bridge + vid + pid + handle == nullptr) so
+ * a re-plug lands in the original SAT>IP adapter slot; falls back to
+ * a fresh slot when none matches. Returns the a[] index, or -1.
+ *
+ * call_init_hw=false at startup (init_all_hw will sweep all a[] slots);
+ * call_init_hw=true from the hotplug worker (init_all_hw has already
+ * completed). */
+int register_handle(dvb_frontend_handle_t *handle,
+                    dvb_hotplug_bridge_t bridge,
+                    uint16_t vid, uint16_t pid,
+                    bool call_init_hw) {
+    int fn = -1;
+    {
+        std::lock_guard<SMutex> lk(g_state_mutex);
+        /* Prefer reusing the same-identity vacated slot. */
+        for (int i = 0; i < g_state_count; i++) {
+            if (g_state[i].handle == nullptr &&
+                g_state[i].bridge == bridge &&
+                g_state[i].vid    == vid &&
+                g_state[i].pid    == pid) {
+                fn = i;
+                break;
+            }
+        }
+        if (fn < 0) {
+            if (g_state_count >= MAX_ADAPTERS) {
+                LOG("hotplug: g_state full, cannot register %s",
+                    handle->display_name);
+                return -1;
+            }
+            fn = g_state_count;
+            g_state[fn]        = adapter_state{};
+            g_state[fn].dvr_fd = -1;
+            g_state[fn].bridge = bridge;
+            g_state[fn].vid    = vid;
+            g_state[fn].pid    = pid;
+            g_state_count++;
+        }
+        g_state[fn].handle = handle;
+    }
+
+    int ai = adapter_find_by_fn(fn);
+    if (ai < 0) {
+        adapter *ad = adapter_alloc();
+        if (!ad) {
+            std::lock_guard<SMutex> lk(g_state_mutex);
+            g_state[fn].handle = nullptr;
+            return -1;
+        }
+        populate_one(ad, fn);
+        ai = adapter_register(ad);
+        if (ai < 0) {
+            delete ad;
+            std::lock_guard<SMutex> lk(g_state_mutex);
+            g_state[fn].handle = nullptr;
+            LOG("hotplug: no free a[] slot for %s", handle->display_name);
+            return -1;
+        }
+        LOG("userspace_dvb: registered adapter slot=%d fn=%d (%s) %04x:%04x",
+            ai, fn, handle->display_name, vid, pid);
+    } else {
+        LOG("hotplug: re-attached fn=%d a[%d] (%s) %04x:%04x",
+            fn, ai, handle->display_name, vid, pid);
+    }
+
+    if (call_init_hw) {
+        int rc = init_hw(ai);
+        if (rc != 0 && rc != 2)
+            LOG("hotplug: init_hw(%d) returned %d", ai, rc);
+    }
+    return ai;
+}
+
+struct hotplug_worker_args {
+    dvb_hotplug_event_t ev;
+};
+
+void worker_done() {
+    std::lock_guard<SMutex> lk(g_state_mutex);
+    if (g_workers_in_flight > 0) g_workers_in_flight--;
+}
+
+void *hotplug_worker(void *p) {
+    auto *args = static_cast<hotplug_worker_args *>(p);
+    dvb_hotplug_event_t ev = args->ev;
+    delete args;
+
+    /* libusb fires one ARRIVED per already-plugged device when we
+     * register with LIBUSB_HOTPLUG_ENUMERATE. Dedup those against
+     * the slots already populated by startup discover_all. */
+    {
+        std::lock_guard<SMutex> lk(g_state_mutex);
+        for (int i = 0; i < g_state_count; i++) {
+            if (g_state[i].handle &&
+                g_state[i].handle->bus_number     == ev.bus &&
+                g_state[i].handle->device_address == ev.devaddr) {
+                /* Drop counter inline; can't use worker_done()
+                 * because we're already holding g_state_mutex. */
+                if (g_workers_in_flight > 0) g_workers_in_flight--;
+                return nullptr;
+            }
+        }
+    }
+
+    dvb_frontend_handle_t *handles[MAX_ADAPTERS] = {};
+    int n = 0;
+    switch (ev.bridge) {
+        case DVB_HOTPLUG_BRIDGE_EM28XX:
+            n = dvb_em28xx_open_by_addr (ev.bus, ev.devaddr,
+                                         handles, MAX_ADAPTERS); break;
+        case DVB_HOTPLUG_BRIDGE_DIB0700:
+            n = dvb_dib0700_open_by_addr(ev.bus, ev.devaddr,
+                                         handles, MAX_ADAPTERS); break;
+        case DVB_HOTPLUG_BRIDGE_DVBSKY:
+            n = dvb_dvbsky_open_by_addr (ev.bus, ev.devaddr,
+                                         handles, MAX_ADAPTERS); break;
+        default: break;
+    }
+    if (n <= 0) {
+        LOG("hotplug: open_by_addr(bus=%u devaddr=%u bridge=%d) -> %d",
+            ev.bus, ev.devaddr, (int)ev.bridge, n);
+        worker_done();
+        return nullptr;
+    }
+    for (int i = 0; i < n; i++) {
+        register_handle(handles[i], ev.bridge, ev.vid, ev.pid,
+                        /*call_init_hw=*/true);
+    }
+    worker_done();
+    return nullptr;
+}
+
+void handle_arrived(const dvb_hotplug_event_t &ev) {
+    LOG("hotplug: ARRIVED %04x:%04x bus=%u devaddr=%u bridge=%d",
+        ev.vid, ev.pid, ev.bus, ev.devaddr, (int)ev.bridge);
+    auto *args = new hotplug_worker_args{ev};
+    /* Increment BEFORE pthread_create so a fast shutdown can't miss
+     * the worker. Decrement at worker exit (or on create failure). */
+    {
+        std::lock_guard<SMutex> lk(g_state_mutex);
+        g_workers_in_flight++;
+    }
+    pthread_t tid;
+    if (pthread_create(&tid, nullptr, hotplug_worker, args) != 0) {
+        LOG("hotplug: pthread_create failed for ARRIVED");
+        delete args;
+        worker_done();
+        return;
+    }
+    pthread_detach(tid);
+}
+
+void handle_left(const dvb_hotplug_event_t &ev) {
+    /* Multi-frontend boards (e.g. WinTV-dualHD) register one g_state
+     * slot per frontend, all sharing the same (bus, devaddr). On LEFT
+     * we must mark + close every one of them — if the active-reader
+     * sibling races in via -ENODEV first, this loop still cleans up
+     * the remaining idle siblings whose sys[] would otherwise stay
+     * advertised forever. */
+    int matched[MAX_ADAPTERS];
+    int n_matched = 0;
+    {
+        std::lock_guard<SMutex> lk(g_state_mutex);
+        for (int i = 0; i < g_state_count && n_matched < MAX_ADAPTERS; i++) {
+            if (g_state[i].handle &&
+                g_state[i].handle->bus_number     == ev.bus &&
+                g_state[i].handle->device_address == ev.devaddr) {
+                /* Mark BEFORE close_adapter so dvb_close sees the flag. */
+                g_state[i].engine_dead = true;
+                matched[n_matched++] = i;
+            }
+        }
+    }
+    if (n_matched == 0) return;   /* not one of ours */
+
+    for (int k = 0; k < n_matched; k++) {
+        int fn = matched[k];
+        int ai = adapter_find_by_fn(fn);
+        bool was_enabled = (ai >= 0 && a[ai] && a[ai]->enabled);
+        LOG("hotplug: LEFT bus=%u devaddr=%u fn=%d a=%d enabled=%d",
+            ev.bus, ev.devaddr, fn, ai, was_enabled);
+
+        if (was_enabled) {
+            /* close_adapter -> ad->close() -> dvb_close reads
+             * engine_dead and clears ad->sys[]. The reader thread may
+             * race in via -ENODEV from read_ts; close_adapter is
+             * idempotent under ad->mutex (adapter.cpp:386-389). */
+            close_adapter(ai);
+        } else {
+            /* Idle slot — dvb_close isn't going to run. Do the
+             * equivalent work here. Take ad->mutex around sys[] —
+             * init_hw mutates it under the same lock, and even if
+             * today both paths run on the main event-loop thread we
+             * shouldn't rely on that scheduling invariant. */
+            if (ai >= 0 && a[ai]) {
+                std::lock_guard<SMutex> alk(a[ai]->mutex);
+                memset(a[ai]->sys, 0, sizeof(a[ai]->sys));
+            }
+            std::lock_guard<SMutex> lk(g_state_mutex);
+            if (fn < g_state_count) {
+                g_state[fn].handle      = nullptr;
+                g_state[fn].engine_dead = false;
+            }
+        }
+    }
+}
+
+int hotplug_event_action(sockets *ss) {
+    (void)ss;
+    dvb_hotplug_event_t ev;
+    while (dvb_hotplug_pop(&ev) == 1) {
+        if (ev.kind == DVB_HOTPLUG_ARRIVED) handle_arrived(ev);
+        else if (ev.kind == DVB_HOTPLUG_LEFT) handle_left(ev);
+    }
+    return 0;
+}
+
+dvb_hotplug_bridge_t bridge_of_discover(int handle_idx,
+                                        int em_n, int dib_n) {
+    if (handle_idx < em_n)            return DVB_HOTPLUG_BRIDGE_EM28XX;
+    if (handle_idx < em_n + dib_n)    return DVB_HOTPLUG_BRIDGE_DIB0700;
+    return DVB_HOTPLUG_BRIDGE_DVBSKY;
 }
 
 }  // namespace
@@ -513,6 +876,8 @@ void populate_one(adapter *ad, int handle_index) {
 /* ---- Public entry points ---------------------------------------- */
 
 void find_userspace_dvb_adapter(adapter **a) {
+    (void)a;   /* adapter_register manages a[] under a_mutex. */
+
     /* Plumb the firmware directory into linuxdvbkpi before any
      * engine open — chip drivers' request_firmware() resolves
      * through this. The dib0700 engine reads $FIRMWARE_DIR directly
@@ -530,33 +895,103 @@ void find_userspace_dvb_adapter(adapter **a) {
     }
 
     dvb_frontend_handle_t *handles[MAX_ADAPTERS] = {};
-    int total = 0;
-    total += dvb_em28xx_discover_all (&handles[total], MAX_ADAPTERS - total);
-    total += dvb_dib0700_discover_all(&handles[total], MAX_ADAPTERS - total);
-    total += dvb_dvbsky_discover_all (&handles[total], MAX_ADAPTERS - total);
+    int em_n  = dvb_em28xx_discover_all (&handles[0],         MAX_ADAPTERS);
+    int dib_n = dvb_dib0700_discover_all(&handles[em_n],
+                                         MAX_ADAPTERS - em_n);
+    int sky_n = dvb_dvbsky_discover_all (&handles[em_n + dib_n],
+                                         MAX_ADAPTERS - em_n - dib_n);
+    int total = em_n + dib_n + sky_n;
+
+    for (int k = 0; k < total; k++) {
+        dvb_hotplug_bridge_t b = bridge_of_discover(k, em_n, dib_n);
+        uint16_t vid = 0, pid = 0;
+        if (scan_bridge_vidpid(b, handles[k]->bus_number,
+                                  handles[k]->device_address,
+                                  &vid, &pid) != 0) {
+            LOG("userspace_dvb: scan_present couldn't resolve VID:PID "
+                "for %s (bus=%u devaddr=%u) - hotplug may miss re-plug",
+                handles[k]->display_name,
+                handles[k]->bus_number, handles[k]->device_address);
+        }
+        register_handle(handles[k], b, vid, pid, /*call_init_hw=*/false);
+    }
 
     if (total == 0) {
-        LOG("userspace_dvb: no supported DVB devices found");
-        return;
+        LOG("userspace_dvb: no supported DVB devices found at startup "
+            "- hotplug stays armed so devices plugged in later are picked up");
     }
 
-    int populated = 0;
-    for (int slot = 0; slot < MAX_ADAPTERS && populated < total; slot++) {
-        if (a[slot]) continue;
-        adapter *ad = adapter_alloc();
-        if (!ad) break;
-        populate_one(ad, populated);
-        g_state[populated].handle = handles[populated];
-        g_state[populated].dvr_fd = -1;
-        a[slot] = ad;
-        LOG("userspace_dvb: registered adapter slot=%d fn=%d (%s)",
-            slot, populated, handles[populated]->display_name);
-        populated++;
+    /* Hotplug wakeup pipe. Non-blocking on both ends (the byte-write
+     * runs on usbq's libusb event thread and must not stall). */
+    int p[2];
+    if (pipe(p) != 0) {
+        LOG("userspace_dvb: pipe() for hotplug wake failed: %s",
+            strerror(errno));
+        return;
     }
-    g_state_count = populated;
+    int rflags = fcntl(p[0], F_GETFL);
+    int wflags = fcntl(p[1], F_GETFL);
+    fcntl(p[0], F_SETFL, (rflags < 0 ? 0 : rflags) | O_NONBLOCK);
+    fcntl(p[1], F_SETFL, (wflags < 0 ? 0 : wflags) | O_NONBLOCK);
+
+    int rc = dvb_hotplug_init(p[1]);
+    if (rc != 0) {
+        LOG("userspace_dvb: dvb_hotplug_init failed (%d) - hotplug disabled",
+            rc);
+        close(p[0]);
+        close(p[1]);
+        return;
+    }
+    int sid = sockets_add(p[0], NULL, -1, TYPE_TCP,
+                          (socket_action)hotplug_event_action,
+                          NULL, NULL);
+    if (sid < 0) {
+        LOG("userspace_dvb: sockets_add for hotplug pipe failed");
+        dvb_hotplug_shutdown();
+        close(p[0]);
+        close(p[1]);
+        return;
+    }
+    hotplug_pipe_rd = p[0];
+    hotplug_pipe_wr = p[1];
+    hotplug_active = true;
+    LOG("userspace_dvb: hotplug armed (pipe r=%d w=%d, sock=%d)",
+        hotplug_pipe_rd, hotplug_pipe_wr, sid);
 }
 
 void userspace_dvb_shutdown(void) {
+    if (hotplug_active) {
+        /* Stop new events first so no new workers spawn during the drain. */
+        dvb_hotplug_shutdown();
+        hotplug_active = false;
+    }
+
+    /* Drain in-flight ARRIVED workers (bounded). Workers touch g_state
+     * and call into adapter.cpp; running engine shutdown while they
+     * dereference handles would be a use-after-free. 5 s ceiling is
+     * generous — firmware upload is the slow path and tops out under
+     * 3 s on the supported boards. */
+    const int max_wait_ms = 5000;
+    const int step_ms     = 50;
+    for (int waited = 0; waited < max_wait_ms; waited += step_ms) {
+        int in_flight;
+        {
+            std::lock_guard<SMutex> lk(g_state_mutex);
+            in_flight = g_workers_in_flight;
+        }
+        if (in_flight == 0) break;
+        struct timespec ts = { 0, step_ms * 1000L * 1000L };
+        nanosleep(&ts, nullptr);
+    }
+    {
+        std::lock_guard<SMutex> lk(g_state_mutex);
+        if (g_workers_in_flight > 0)
+            LOG("userspace_dvb: shutdown with %d hotplug worker(s) still in "
+                "flight - proceeding anyway", g_workers_in_flight);
+    }
+
+    if (hotplug_pipe_wr >= 0) { close(hotplug_pipe_wr); hotplug_pipe_wr = -1; }
+    if (hotplug_pipe_rd >= 0) { close(hotplug_pipe_rd); hotplug_pipe_rd = -1; }
     /* Reverse order of discovery — same convention as the rest of
      * the stack. */
     dvb_dvbsky_shutdown();
