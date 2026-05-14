@@ -152,6 +152,10 @@ struct struct_adapter {
     // called when the adapter is closed
     int (*close)(adapter *ad);
     void (*free)(adapter *ad);
+    // Optional: 1 if the underlying device is physically present, 0
+    // if it has been removed (e.g. USB unplug). NULL => always present
+    // — legacy backends with no notion of removable hardware.
+    int (*is_present)(adapter *ad);
 };
 
 extern adapter *a[MAX_ADAPTERS];
@@ -163,6 +167,7 @@ int init_hw(int i);
 int init_all_hw();
 int getAdaptersCount();
 adapter *adapter_alloc();
+int adapter_register(adapter *ad);
 int close_adapter(int na);
 int get_free_adapter(transponder *tp);
 int set_adapter_for_stream(int sid, int aid);

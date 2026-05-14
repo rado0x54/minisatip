@@ -71,6 +71,18 @@ int tuner_s2, tuner_t, tuner_c, tuner_t2, tuner_c2, tuner_at, tuner_ac;
 int16_t fe_map[2 * MAX_ADAPTERS];
 void find_dvb_adapter(adapter **a);
 
+int adapter_register(adapter *ad) {
+    if (!ad) return -1;
+    std::lock_guard<SMutex> lock(a_mutex);
+    for (int i = 0; i < MAX_ADAPTERS; i++) {
+        if (!a[i]) {
+            a[i] = ad;
+            return i;
+        }
+    }
+    return -1;
+}
+
 adapter *adapter_alloc() {
     adapter *ad = new adapter();
 
@@ -2150,6 +2162,14 @@ int get_adapter_decerrs(int aid) {
     return dec;
 }
 
+int get_adapter_present(int aid) {
+    if (aid < 0 || aid >= MAX_ADAPTERS || !a[aid])
+        return 0;
+    if (a[aid]->is_present)
+        return a[aid]->is_present(a[aid]);
+    return 1;
+}
+
 int get_adapter_fe(int aid) {
     int fe;
     uint32_t i;
@@ -2187,6 +2207,8 @@ _symbols adapters_sym[] = {
     {"ad_stream", VAR_AARRAY_INT, a, 1, MAX_ADAPTERS,
      offsetof(adapter, tp.plp_isi)},
     {"ad_fe", VAR_FUNCTION_INT, (void *)&get_adapter_fe, 0, MAX_ADAPTERS, 0},
+    {"ad_present", VAR_FUNCTION_INT, (void *)&get_adapter_present, 0,
+     MAX_ADAPTERS, 0},
     {"ad_master", VAR_AARRAY_UINT8, a, 1, MAX_ADAPTERS,
      offsetof(adapter, master_sid)},
     {"ad_sidcount", VAR_AARRAY_UINT8, a, 1, MAX_ADAPTERS,
