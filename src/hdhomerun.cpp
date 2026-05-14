@@ -78,8 +78,6 @@ static uint32_t hdhr_crc32(const uint8_t *buf, int len) {
 // on each of its 2 FEs) would inflate to 4. Walking a[] gives the actual
 // number of concurrent streams the device can serve.
 static int active_tuner_count(void) {
-    if (opts.hdhr_tuners > 0)
-        return opts.hdhr_tuners;
     int n = 0;
     for (int i = 0; i < MAX_ADAPTERS; i++)
         if (a[i])
@@ -169,13 +167,13 @@ static int hdhr_load_m3u(const char *path) {
 }
 
 static void hdhr_maybe_reload(void) {
-    if (!opts.hdhr_channels)
+    if (!opts.hdhr_playlist_path)
         return;
     struct stat st;
-    if (stat(opts.hdhr_channels, &st) != 0)
+    if (stat(opts.hdhr_playlist_path, &st) != 0)
         return;
     if (st.st_mtime != opts.hdhr_m3u_mtime)
-        hdhr_load_m3u(opts.hdhr_channels);
+        hdhr_load_m3u(opts.hdhr_playlist_path);
 }
 
 // Extract host[:port] from the request. Returns whatever the client used
@@ -254,8 +252,7 @@ static int json_escape(const char *src, char *dst, int dstsz) {
 static int build_discover_json(const char *host, char *buf, int sz) {
     int ptr = 0;
     char name_esc[HDHR_NAME_LEN * 2];
-    json_escape(opts.hdhr_name ? opts.hdhr_name : "minisatip", name_esc,
-                sizeof(name_esc));
+    json_escape("minisatip", name_esc, sizeof(name_esc));
     strlcatf(buf, sz, ptr,
              "{"
              "\"FriendlyName\":\"%s\","
@@ -305,8 +302,7 @@ static int build_device_xml(const char *host, char *buf, int sz) {
     // device.xml is XML not JSON, but the same escape avoids quotes/control
     // chars; HDHR clients tolerate this and the M3U-supplied names rarely
     // contain XML-significant characters.
-    json_escape(opts.hdhr_name ? opts.hdhr_name : "minisatip", name_esc,
-                sizeof(name_esc));
+    json_escape("minisatip", name_esc, sizeof(name_esc));
     strlcatf(buf, sz, ptr,
              "<?xml version=\"1.0\"?>"
              "<root xmlns=\"urn:schemas-upnp-org:device-1-0\">"
@@ -328,13 +324,12 @@ static int build_device_xml(const char *host, char *buf, int sz) {
 int hdhr_init(void) {
     hdhr_compute_device_id();
     hdhr_build_crc_table();
-    if (opts.hdhr_channels) {
-        if (hdhr_load_m3u(opts.hdhr_channels) < 0)
+    if (opts.hdhr_playlist_path) {
+        if (hdhr_load_m3u(opts.hdhr_playlist_path) < 0)
             return -1;
     }
-    LOG("HDHR: initialised (DeviceID=%08X, tuners=%d, name=\"%s\")",
-        hdhr_device_id, active_tuner_count(),
-        opts.hdhr_name ? opts.hdhr_name : "minisatip");
+    LOG("HDHR: initialised (DeviceID=%08X, tuners=%d, name=\"minisatip\")",
+        hdhr_device_id, active_tuner_count());
     return 0;
 }
 

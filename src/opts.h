@@ -46,7 +46,8 @@ typedef struct struct_opts {
     int rtsp_port;
     uint8_t netcv_count;
     char *netcv_if;
-    char *playlist;
+    char *playlist;     // pre-wrapped <satip:X_SATIPM3U> XML for /desc.xml
+    char *playlist_arg; // raw -p argument (for FS resolution + HDHR activation)
     const char *log_file;
     int use_ipv4_only;
     int use_demux_device;
@@ -84,9 +85,11 @@ typedef struct struct_opts {
     const char *firmware_dir; // NULL = use FIRMWARE_DIR env + fallback probe
 #endif
 #ifndef DISABLE_HDHOMERUN
-    char *hdhr_channels;   // M3U path (NULL = feature disabled at runtime)
-    char *hdhr_name;       // friendly name advertised to clients
-    int hdhr_tuners;       // 0 = auto from enabled adapter count
+    // HDHomeRun emulation activates when -p / --playlist resolves
+    // to a real M3U file within the document_root. Resolution happens
+    // post-getopt in resolve_playlist_to_fs(); the resolved canonical
+    // path is stored here (malloc'd; NULL = feature off).
+    char *hdhr_playlist_path;
     time_t hdhr_m3u_mtime; // mtime cache key for hot reload
 #endif
 } struct_opts_t;

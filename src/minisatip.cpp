@@ -142,9 +142,6 @@ int rtsp, http, si, si1, ssdp1;
 #define SENDALLECM_OPT (LONG_OPT_ONLY_START + 2)
 #define SATIPC_RECV_BUFFER_OPT (LONG_OPT_ONLY_START + 3)
 #define CLIENT_SEND_BUFFER_OPT (LONG_OPT_ONLY_START + 4)
-#define HDHR_CHANNELS_OPT (LONG_OPT_ONLY_START + 5)
-#define HDHR_NAME_OPT (LONG_OPT_ONLY_START + 6)
-#define HDHR_TUNERS_OPT (LONG_OPT_ONLY_START + 7)
 #define FIRMWARE_DIR_OPT (LONG_OPT_ONLY_START + 8)
 
 static const struct option long_options[] = {
@@ -214,11 +211,6 @@ static const struct option long_options[] = {
     {"ca-pin", required_argument, NULL, CA_PIN_OPT},
     {"ci", required_argument, NULL, FORCE_CI_OPT},
     {"ca-channels", required_argument, NULL, CA_CHANNELS_OPT},
-#endif
-#ifndef DISABLE_HDHOMERUN
-    {"hdhomerun-channels", required_argument, NULL, HDHR_CHANNELS_OPT},
-    {"hdhomerun-name", required_argument, NULL, HDHR_NAME_OPT},
-    {"hdhomerun-tuners", required_argument, NULL, HDHR_TUNERS_OPT},
 #endif
 #ifndef DISABLE_USERSPACE_DVB
     {"firmware-dir", required_argument, NULL, FIRMWARE_DIR_OPT},
@@ -463,6 +455,12 @@ Help\n\
 * -p --playlist url: specify playlist url using X_SATIPM3U header \n\
 	* eg: -p http://192.168.2.3:8080/playlist\n\
 	- this will add X_SATIPM3U tag into the satip description xml\n\
+	- if the value resolves to a real M3U file within the document\n\
+	  root (-R), HDHomeRun tuner emulation is also enabled and the\n\
+	  same file is used as the channel source. Paths that escape the\n\
+	  document root (e.g. ../..) are rejected for filesystem use but\n\
+	  still passed through to the SAT>IP X_SATIPM3U tag verbatim.\n\
+	* eg: -p /munich_dvbt2.m3u\n\
 \n\
 * -P  port: use port number to listen for UDP socket in the RTP communication. port + 1000 will be used to listen by the sat>ip client (option -s)\n \
 	* eg: -P 5500 (default): will use for the sat>ip server 5500 + 2*A and 5500 + 2*A + 1, where A is the adapter number. \n\
@@ -563,16 +561,6 @@ Help\n\
 * -9 --disable-pmt-scan: Disables scanning PMTs and only reads the PMTs that are requested by the client\n\
 \t* Provides more reliable decrypting for channels included in multiple providers\n\
 \n"
-#ifndef DISABLE_HDHOMERUN
-        "\
-* --hdhomerun-channels <path>: enable HDHomeRun tuner emulation, channels read from an M3U file\n\
-\t* The M3U lists channels as #EXTINF:0,<name> followed by a minisatip URL on the next line\n\
-\t* Exposes /discover.json /lineup.json /lineup_status.json /device.xml and UDP discovery on 65001\n\
-\t* Stream URLs in the lineup are rewritten per request using the client's Host: header\n\
-* --hdhomerun-name <name>: friendly name advertised to HDHomeRun clients (default: minisatip)\n\
-* --hdhomerun-tuners <n>: number of concurrent tuners to advertise (default: auto from enabled adapters)\n\
-\n"
-#endif
 #ifndef DISABLE_USERSPACE_DVB
         "\
 * --firmware-dir <path>: directory containing DVB chip-driver firmware blobs\n\
@@ -639,6 +627,72 @@ void get_short_opts(char *short_opts, const struct option *long_options) {
     }
     *short_opts++ = 0;
 }
+
+#ifndef DISABLE_HDHOMERUN
+/*
+ * Resolve a -p / --playlist argument to a canonical filesystem path
+ * inside the document_root, or return NULL if no such file exists.
+ *
+ *   - URL-like values (containing "://") are not filesystem targets;
+ *     skip silently. Caller may keep using opts.playlist verbatim for
+ *     the SAT>IP X_SATIPM3U passthrough.
+ *   - Everything else is joined as <document_root>/<playlist_arg>
+ *     and canonicalized. Paths whose realpath escapes the canonical
+ *     document_root (e.g. via "..") are rejected.
+ *
+ * Returns malloc'd path on success (caller frees). Returns NULL on
+ * any failure; sets *out_reason to a short, log-safe explanation
+ * when the failure is one we want to warn about (set to NULL for
+ * "this clearly wasn't meant to be a file").
+ */
+static char *resolve_playlist_to_fs(const char *playlist_arg,
+                                    const char *doc_root,
+                                    const char **out_reason) {
+    *out_reason = NULL;
+    if (!playlist_arg || !*playlist_arg)
+        return NULL;
+    if (strstr(playlist_arg, "://"))
+        return NULL; // URL — not a filesystem candidate
+
+    char *real_root = realpath(doc_root ? doc_root : ".", NULL);
+    if (!real_root) {
+        *out_reason = "document root does not exist on disk";
+        return NULL;
+    }
+
+    const char *suffix = playlist_arg;
+    while (*suffix == '/')
+        suffix++; // treat leading slashes as relative to doc_root
+
+    size_t need = strlen(real_root) + 1 + strlen(suffix) + 1;
+    char *candidate = (char *)malloc(need);
+    if (!candidate) {
+        free(real_root);
+        return NULL;
+    }
+    snprintf(candidate, need, "%s/%s", real_root, suffix);
+
+    char *real_candidate = realpath(candidate, NULL);
+    free(candidate);
+    if (!real_candidate) {
+        *out_reason = "file does not exist within document root";
+        free(real_root);
+        return NULL;
+    }
+
+    size_t root_len = strlen(real_root);
+    int within = (strncmp(real_candidate, real_root, root_len) == 0 &&
+                  (real_candidate[root_len] == '/' ||
+                   real_candidate[root_len] == '\0'));
+    free(real_root);
+    if (!within) {
+        *out_reason = "path escapes document root";
+        free(real_candidate);
+        return NULL;
+    }
+    return real_candidate;
+}
+#endif
 
 void set_options(int argc, char *argv[]) {
     int opt;
@@ -711,9 +765,7 @@ void set_options(int argc, char *argv[]) {
         0; // offset for multiple dvbapi clients to the same server
 
 #ifndef DISABLE_HDHOMERUN
-    opts.hdhr_channels = NULL;
-    opts.hdhr_name = (char *)"minisatip";
-    opts.hdhr_tuners = 0; // 0 = auto from adapter count
+    opts.hdhr_playlist_path = NULL;
     opts.hdhr_m3u_mtime = 0;
 #endif
 #ifndef DISABLE_USERSPACE_DVB
@@ -901,6 +953,7 @@ void set_options(int argc, char *argv[]) {
 
         case PLAYLIST_OPT: {
             if (strlen(optarg) < 1000) {
+                opts.playlist_arg = optarg;
                 opts.playlist = (char *)malloc(strlen(optarg) + 200);
                 if (opts.playlist)
                     sprintf(opts.playlist,
@@ -1125,17 +1178,6 @@ void set_options(int argc, char *argv[]) {
             break;
 
 #endif
-#ifndef DISABLE_HDHOMERUN
-        case HDHR_CHANNELS_OPT:
-            opts.hdhr_channels = optarg;
-            break;
-        case HDHR_NAME_OPT:
-            opts.hdhr_name = optarg;
-            break;
-        case HDHR_TUNERS_OPT:
-            opts.hdhr_tuners = atoi(optarg);
-            break;
-#endif
 #ifndef DISABLE_USERSPACE_DVB
         case FIRMWARE_DIR_OPT:
             opts.firmware_dir = optarg;
@@ -1143,6 +1185,25 @@ void set_options(int argc, char *argv[]) {
 #endif
         }
     }
+
+#ifndef DISABLE_HDHOMERUN
+    // HDHomeRun emulation: activate iff -p resolves to a real M3U
+    // file inside the document_root. URL-style values pass through
+    // for the SAT>IP X_SATIPM3U tag without enabling HDHR.
+    if (opts.playlist_arg) {
+        const char *reason = NULL;
+        char *p =
+            resolve_playlist_to_fs(opts.playlist_arg, opts.document_root, &reason);
+        if (p) {
+            opts.hdhr_playlist_path = p;
+            LOG("HDHR: enabled from -p (resolved to %s)", p);
+        } else if (reason) {
+            LOG("HDHR: -p %s could not be used as a channel source: %s "
+                "(SAT>IP X_SATIPM3U passthrough still active)",
+                opts.playlist_arg, reason);
+        }
+    }
+#endif
 
     if (!opts.bind)
         lip = getlocalip();
@@ -1619,7 +1680,7 @@ int read_http(sockets *s) {
     }
 
 #ifndef DISABLE_HDHOMERUN
-    if (opts.hdhr_channels && hdhr_handle_http(s, arg, la))
+    if (opts.hdhr_playlist_path && hdhr_handle_http(s, arg, la))
         return 0;
 #endif
 
@@ -1956,9 +2017,10 @@ int main(int argc, char *argv[]) {
     }
 
 #ifndef DISABLE_HDHOMERUN
-    if (opts.hdhr_channels) {
+    if (opts.hdhr_playlist_path) {
         if (hdhr_init() < 0)
-            FAIL("HDHR: init failed (could not load %s)", opts.hdhr_channels);
+            FAIL("HDHR: init failed (could not load %s)",
+                 opts.hdhr_playlist_path);
         int hdhr_sock =
             udp_bind(opts.bind, HDHR_DISCOVERY_PORT, opts.use_ipv4_only);
         if (hdhr_sock < 1)
