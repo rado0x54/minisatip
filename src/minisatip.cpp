@@ -145,6 +145,7 @@ int rtsp, http, si, si1, ssdp1;
 #define HDHR_CHANNELS_OPT (LONG_OPT_ONLY_START + 5)
 #define HDHR_NAME_OPT (LONG_OPT_ONLY_START + 6)
 #define HDHR_TUNERS_OPT (LONG_OPT_ONLY_START + 7)
+#define FIRMWARE_DIR_OPT (LONG_OPT_ONLY_START + 8)
 
 static const struct option long_options[] = {
     {"adapters", required_argument, NULL, ADAPTERS_OPT},
@@ -218,6 +219,9 @@ static const struct option long_options[] = {
     {"hdhomerun-channels", required_argument, NULL, HDHR_CHANNELS_OPT},
     {"hdhomerun-name", required_argument, NULL, HDHR_NAME_OPT},
     {"hdhomerun-tuners", required_argument, NULL, HDHR_TUNERS_OPT},
+#endif
+#ifndef DISABLE_USERSPACE_DVB
+    {"firmware-dir", required_argument, NULL, FIRMWARE_DIR_OPT},
 #endif
 
     {0, 0, 0, 0}};
@@ -569,6 +573,13 @@ Help\n\
 * --hdhomerun-tuners <n>: number of concurrent tuners to advertise (default: auto from enabled adapters)\n\
 \n"
 #endif
+#ifndef DISABLE_USERSPACE_DVB
+        "\
+* --firmware-dir <path>: directory containing DVB chip-driver firmware blobs\n\
+\t* Overrides $FIRMWARE_DIR and the built-in fallback search\n\
+\t  (/usr/local/share/minisatip/firmware, /usr/local/lib/firmware, /usr/lib/firmware, /lib/firmware)\n\
+\n"
+#endif
 #ifndef DISABLE_DVBCA
         "\
 * -3 --ca-pin mapping_string: set the pin for CIs\n\
@@ -704,6 +715,9 @@ void set_options(int argc, char *argv[]) {
     opts.hdhr_name = (char *)"minisatip";
     opts.hdhr_tuners = 0; // 0 = auto from adapter count
     opts.hdhr_m3u_mtime = 0;
+#endif
+#ifndef DISABLE_USERSPACE_DVB
+    opts.firmware_dir = NULL;
 #endif
 
     opts.name_app = app_name;
@@ -1120,6 +1134,11 @@ void set_options(int argc, char *argv[]) {
             break;
         case HDHR_TUNERS_OPT:
             opts.hdhr_tuners = atoi(optarg);
+            break;
+#endif
+#ifndef DISABLE_USERSPACE_DVB
+        case FIRMWARE_DIR_OPT:
+            opts.firmware_dir = optarg;
             break;
 #endif
         }

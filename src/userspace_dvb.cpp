@@ -114,6 +114,10 @@ const char *resolve_firmware_dir(void) {
     };
     static thread_local std::string cached;
 
+    if (opts.firmware_dir && opts.firmware_dir[0]) {
+        cached = opts.firmware_dir;
+        return cached.c_str();
+    }
     const char *env = std::getenv("FIRMWARE_DIR");
     if (env && env[0]) { cached = env; return cached.c_str(); }
     /* Probe for any of the well-known firmware filenames our
@@ -509,11 +513,14 @@ void populate_one(adapter *ad, int handle_index) {
 void find_userspace_dvb_adapter(adapter **a) {
     /* Plumb the firmware directory into linuxdvbkpi before any
      * engine open — chip drivers' request_firmware() resolves
-     * through this. The dib0700 engine also reads $FIRMWARE_DIR
-     * directly for its bridge ramcode upload. */
+     * through this. The dib0700 engine reads $FIRMWARE_DIR directly
+     * for its bridge ramcode upload, so we also setenv() the resolved
+     * path so it sees the same root the user supplied via
+     * --firmware-dir or the fallback probe. */
     const char *fw_dir = resolve_firmware_dir();
     if (fw_dir) {
         linuxdvbkpi_set_firmware_root(fw_dir);
+        setenv("FIRMWARE_DIR", fw_dir, 1);
     } else {
         LOG("userspace_dvb: no FIRMWARE_DIR set and no fallback path "
             "contains a known DVB blob — boards needing firmware "

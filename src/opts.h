@@ -80,6 +80,9 @@ typedef struct struct_opts {
     char pmt_scan;
     char emulate_pids_all;
     const char *cache_dir;
+#ifndef DISABLE_USERSPACE_DVB
+    const char *firmware_dir; // NULL = use FIRMWARE_DIR env + fallback probe
+#endif
 #ifndef DISABLE_HDHOMERUN
     char *hdhr_channels;   // M3U path (NULL = feature disabled at runtime)
     char *hdhr_name;       // friendly name advertised to clients
