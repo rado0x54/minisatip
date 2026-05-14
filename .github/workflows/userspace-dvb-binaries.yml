@@ -10,7 +10,7 @@ name: Userspace DVB Binaries
 
 on:
   push:
-    branches: [ fork/main, userspace-dvb-support ]
+    branches: [ fork/main ]
     tags: [ 'v*' ]
   pull_request:
     branches: [ fork/main ]
