@@ -5,7 +5,8 @@
  * over dvb-libusb's bridge-generic engines:
  *
  *   find_userspace_dvb_adapter → dvb_em28xx_discover_all() +
- *                                dvb_dib0700_discover_all()
+ *                                dvb_dib0700_discover_all() +
+ *                                dvb_dvbsky_discover_all()
  *                              → for each handle, allocate an adapter
  *                                slot and set callbacks (all common,
  *                                dispatch through handle->ops).
@@ -35,6 +36,7 @@
 #include "dvb_handle/dvb_debug.h"
 #include "dvb_em28xx/dvb_em28xx.h"
 #include "dvb_dib0700/dvb_dib0700.h"
+#include "dvb_dvbsky/dvb_dvbsky.h"
 #include <linuxdvbkpi/firmware_root.h>
 
 #include <cerrno>
@@ -531,6 +533,7 @@ void find_userspace_dvb_adapter(adapter **a) {
     int total = 0;
     total += dvb_em28xx_discover_all (&handles[total], MAX_ADAPTERS - total);
     total += dvb_dib0700_discover_all(&handles[total], MAX_ADAPTERS - total);
+    total += dvb_dvbsky_discover_all (&handles[total], MAX_ADAPTERS - total);
 
     if (total == 0) {
         LOG("userspace_dvb: no supported DVB devices found");
@@ -556,6 +559,7 @@ void find_userspace_dvb_adapter(adapter **a) {
 void userspace_dvb_shutdown(void) {
     /* Reverse order of discovery — same convention as the rest of
      * the stack. */
+    dvb_dvbsky_shutdown();
     dvb_dib0700_shutdown();
     dvb_em28xx_shutdown();
     for (int i = 0; i < g_state_count; i++) {
