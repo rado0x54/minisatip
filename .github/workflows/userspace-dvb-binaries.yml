@@ -10,10 +10,10 @@ name: Userspace DVB Binaries
 
 on:
   push:
-    branches: [ master, userspace-dvb-support ]
+    branches: [ fork/main, userspace-dvb-support ]
     tags: [ 'v*' ]
   pull_request:
-    branches: [ master ]
+    branches: [ fork/main ]
   workflow_dispatch:
 
 env:

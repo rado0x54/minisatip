@@ -1,9 +1,9 @@
 name: Build
 on:
   push:
-    branches: [ master, next ]
+    branches: [ fork/main ]
   pull_request:
-    branches: [ master, next ]
+    branches: [ fork/main ]
 
 jobs:
   build:
