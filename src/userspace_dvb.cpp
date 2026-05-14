@@ -105,14 +105,21 @@ adapter_state g_state[MAX_ADAPTERS];
 int           g_state_count = 0;
 
 /* Lock ordering: a_mutex -> ad->mutex -> g_state_mutex. g_state_mutex
- * MUST NOT be held when calling adapter_register / init_hw /
- * close_adapter. Take it briefly to read or publish g_state[]; release
- * before dispatching into adapter.cpp. */
+ * MUST NOT be held when calling adapter_register / adapter_find_by_fn /
+ * init_hw / close_adapter. Take it briefly to read or publish g_state[];
+ * release before dispatching into adapter.cpp. */
 SMutex g_state_mutex;
 
 int hotplug_pipe_rd = -1;
 int hotplug_pipe_wr = -1;
 bool hotplug_active = false;
+
+/* Count of in-flight ARRIVED worker threads. Incremented under
+ * g_state_mutex by handle_arrived before pthread_create; decremented
+ * by hotplug_worker on exit. userspace_dvb_shutdown drains this with
+ * a bounded wait so workers stop touching g_state / a[] before we
+ * tear the engines down. */
+int g_workers_in_flight = 0;
 
 adapter_state *state_for(adapter *ad) {
     if (!ad || ad->fn < 0 || ad->fn >= MAX_ADAPTERS) return nullptr;
@@ -308,20 +315,29 @@ int dvb_socket_read(int sock, void *buf, size_t len, sockets *ss, int *rv) {
         int got = st->handle->ops->read_ts(st->handle->engine_state,
                                            st->stage + st->stage_len,
                                            headroom, /*timeout_ms=*/0);
-        if (got < 0) {
-            /* Device is dead (usbq returns -ENODEV when stopping is
-             * set and the ring is drained). Mark the slot so dvb_close
+        if (got == -ENODEV) {
+            /* Device is gone: usbq returns -ENODEV when stopping is
+             * set and the ring is drained. Mark the slot so dvb_close
              * knows to clear ad->sys[], then surface to the event
              * loop: read_ok=0 + rlen=0 falls through socketworks'
              * error path to sockets_del -> close_adapter. */
-            LOG("read_ts on %s returned %d - device dead, tearing down",
-                st->handle->display_name, got);
+            LOG("read_ts on %s returned -ENODEV - device gone, tearing down",
+                st->handle->display_name);
             {
                 std::lock_guard<SMutex> lk(g_state_mutex);
                 st->engine_dead = true;
             }
             *rv = 0;
             return 0;
+        }
+        if (got < 0) {
+            /* Other negative — unknown / transient. Log once per call,
+             * treat as "no data this iteration"; do NOT tear the slot
+             * down (avoid silent disappearance on a buggy bridge or a
+             * future error code we don't recognize yet). */
+            LOG("read_ts on %s returned unexpected %d - treating as transient",
+                st->handle->display_name, got);
+            break;
         }
         if (got == 0) break;
         st->stage_len += static_cast<size_t>(got);
@@ -599,13 +615,6 @@ void populate_one(adapter *ad, int handle_index) {
  *   (bridge, vid, pid) reuses this slot, keeping the SAT>IP adapter
  *   number stable across re-plugs of the same board model. */
 
-int find_a_for_fn(int fn) {
-    for (int i = 0; i < MAX_ADAPTERS; i++) {
-        if (a[i] && a[i]->fn == fn) return i;
-    }
-    return -1;
-}
-
 /* Resolve (bus, devaddr) -> (vid, pid) for a startup-discovered handle
  * by scanning the bridge's present-USB list. The discover_all path
  * doesn't expose VID:PID directly; scan_present is libusb-only (no
@@ -679,7 +688,7 @@ int register_handle(dvb_frontend_handle_t *handle,
         g_state[fn].handle = handle;
     }
 
-    int ai = find_a_for_fn(fn);
+    int ai = adapter_find_by_fn(fn);
     if (ai < 0) {
         adapter *ad = adapter_alloc();
         if (!ad) {
@@ -715,6 +724,11 @@ struct hotplug_worker_args {
     dvb_hotplug_event_t ev;
 };
 
+void worker_done() {
+    std::lock_guard<SMutex> lk(g_state_mutex);
+    if (g_workers_in_flight > 0) g_workers_in_flight--;
+}
+
 void *hotplug_worker(void *p) {
     auto *args = static_cast<hotplug_worker_args *>(p);
     dvb_hotplug_event_t ev = args->ev;
@@ -729,6 +743,9 @@ void *hotplug_worker(void *p) {
             if (g_state[i].handle &&
                 g_state[i].handle->bus_number     == ev.bus &&
                 g_state[i].handle->device_address == ev.devaddr) {
+                /* Drop counter inline; can't use worker_done()
+                 * because we're already holding g_state_mutex. */
+                if (g_workers_in_flight > 0) g_workers_in_flight--;
                 return nullptr;
             }
         }
@@ -751,12 +768,14 @@ void *hotplug_worker(void *p) {
     if (n <= 0) {
         LOG("hotplug: open_by_addr(bus=%u devaddr=%u bridge=%d) -> %d",
             ev.bus, ev.devaddr, (int)ev.bridge, n);
+        worker_done();
         return nullptr;
     }
     for (int i = 0; i < n; i++) {
         register_handle(handles[i], ev.bridge, ev.vid, ev.pid,
                         /*call_init_hw=*/true);
     }
+    worker_done();
     return nullptr;
 }
 
@@ -764,52 +783,73 @@ void handle_arrived(const dvb_hotplug_event_t &ev) {
     LOG("hotplug: ARRIVED %04x:%04x bus=%u devaddr=%u bridge=%d",
         ev.vid, ev.pid, ev.bus, ev.devaddr, (int)ev.bridge);
     auto *args = new hotplug_worker_args{ev};
+    /* Increment BEFORE pthread_create so a fast shutdown can't miss
+     * the worker. Decrement at worker exit (or on create failure). */
+    {
+        std::lock_guard<SMutex> lk(g_state_mutex);
+        g_workers_in_flight++;
+    }
     pthread_t tid;
     if (pthread_create(&tid, nullptr, hotplug_worker, args) != 0) {
         LOG("hotplug: pthread_create failed for ARRIVED");
         delete args;
+        worker_done();
         return;
     }
     pthread_detach(tid);
 }
 
 void handle_left(const dvb_hotplug_event_t &ev) {
-    int fn = -1;
+    /* Multi-frontend boards (e.g. WinTV-dualHD) register one g_state
+     * slot per frontend, all sharing the same (bus, devaddr). On LEFT
+     * we must mark + close every one of them — if the active-reader
+     * sibling races in via -ENODEV first, this loop still cleans up
+     * the remaining idle siblings whose sys[] would otherwise stay
+     * advertised forever. */
+    int matched[MAX_ADAPTERS];
+    int n_matched = 0;
     {
         std::lock_guard<SMutex> lk(g_state_mutex);
-        for (int i = 0; i < g_state_count; i++) {
+        for (int i = 0; i < g_state_count && n_matched < MAX_ADAPTERS; i++) {
             if (g_state[i].handle &&
                 g_state[i].handle->bus_number     == ev.bus &&
                 g_state[i].handle->device_address == ev.devaddr) {
-                fn = i;
                 /* Mark BEFORE close_adapter so dvb_close sees the flag. */
                 g_state[i].engine_dead = true;
-                break;
+                matched[n_matched++] = i;
             }
         }
     }
-    if (fn < 0) return;   /* not one of ours */
+    if (n_matched == 0) return;   /* not one of ours */
 
-    int ai = find_a_for_fn(fn);
-    bool was_enabled = (ai >= 0 && a[ai] && a[ai]->enabled);
-    LOG("hotplug: LEFT bus=%u devaddr=%u fn=%d a=%d enabled=%d",
-        ev.bus, ev.devaddr, fn, ai, was_enabled);
+    for (int k = 0; k < n_matched; k++) {
+        int fn = matched[k];
+        int ai = adapter_find_by_fn(fn);
+        bool was_enabled = (ai >= 0 && a[ai] && a[ai]->enabled);
+        LOG("hotplug: LEFT bus=%u devaddr=%u fn=%d a=%d enabled=%d",
+            ev.bus, ev.devaddr, fn, ai, was_enabled);
 
-    if (was_enabled) {
-        /* close_adapter -> ad->close() -> dvb_close reads engine_dead
-         * and clears ad->sys[]. The reader thread may also race in
-         * via -ENODEV from read_ts; close_adapter is idempotent under
-         * ad->mutex (see adapter.cpp:386-389). */
-        close_adapter(ai);
-    } else {
-        /* Idle slot — dvb_close isn't going to run (adapter wasn't
-         * enabled), so do the equivalent work here: drop the handle
-         * and clear sys[] so the slot stops being advertised. */
-        if (ai >= 0 && a[ai]) memset(a[ai]->sys, 0, sizeof(a[ai]->sys));
-        std::lock_guard<SMutex> lk(g_state_mutex);
-        if (fn < g_state_count) {
-            g_state[fn].handle      = nullptr;
-            g_state[fn].engine_dead = false;
+        if (was_enabled) {
+            /* close_adapter -> ad->close() -> dvb_close reads
+             * engine_dead and clears ad->sys[]. The reader thread may
+             * race in via -ENODEV from read_ts; close_adapter is
+             * idempotent under ad->mutex (adapter.cpp:386-389). */
+            close_adapter(ai);
+        } else {
+            /* Idle slot — dvb_close isn't going to run. Do the
+             * equivalent work here. Take ad->mutex around sys[] —
+             * init_hw mutates it under the same lock, and even if
+             * today both paths run on the main event-loop thread we
+             * shouldn't rely on that scheduling invariant. */
+            if (ai >= 0 && a[ai]) {
+                std::lock_guard<SMutex> alk(a[ai]->mutex);
+                memset(a[ai]->sys, 0, sizeof(a[ai]->sys));
+            }
+            std::lock_guard<SMutex> lk(g_state_mutex);
+            if (fn < g_state_count) {
+                g_state[fn].handle      = nullptr;
+                g_state[fn].engine_dead = false;
+            }
         }
     }
 }
@@ -921,9 +961,35 @@ void find_userspace_dvb_adapter(adapter **a) {
 
 void userspace_dvb_shutdown(void) {
     if (hotplug_active) {
+        /* Stop new events first so no new workers spawn during the drain. */
         dvb_hotplug_shutdown();
         hotplug_active = false;
     }
+
+    /* Drain in-flight ARRIVED workers (bounded). Workers touch g_state
+     * and call into adapter.cpp; running engine shutdown while they
+     * dereference handles would be a use-after-free. 5 s ceiling is
+     * generous — firmware upload is the slow path and tops out under
+     * 3 s on the supported boards. */
+    const int max_wait_ms = 5000;
+    const int step_ms     = 50;
+    for (int waited = 0; waited < max_wait_ms; waited += step_ms) {
+        int in_flight;
+        {
+            std::lock_guard<SMutex> lk(g_state_mutex);
+            in_flight = g_workers_in_flight;
+        }
+        if (in_flight == 0) break;
+        struct timespec ts = { 0, step_ms * 1000L * 1000L };
+        nanosleep(&ts, nullptr);
+    }
+    {
+        std::lock_guard<SMutex> lk(g_state_mutex);
+        if (g_workers_in_flight > 0)
+            LOG("userspace_dvb: shutdown with %d hotplug worker(s) still in "
+                "flight - proceeding anyway", g_workers_in_flight);
+    }
+
     if (hotplug_pipe_wr >= 0) { close(hotplug_pipe_wr); hotplug_pipe_wr = -1; }
     if (hotplug_pipe_rd >= 0) { close(hotplug_pipe_rd); hotplug_pipe_rd = -1; }
     /* Reverse order of discovery — same convention as the rest of

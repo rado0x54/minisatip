@@ -83,6 +83,14 @@ int adapter_register(adapter *ad) {
     return -1;
 }
 
+int adapter_find_by_fn(int fn) {
+    std::lock_guard<SMutex> lock(a_mutex);
+    for (int i = 0; i < MAX_ADAPTERS; i++) {
+        if (a[i] && a[i]->fn == fn) return i;
+    }
+    return -1;
+}
+
 adapter *adapter_alloc() {
     adapter *ad = new adapter();
 
