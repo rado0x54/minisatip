@@ -185,14 +185,18 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist firmware
+          cp build/minisatip minisatip
           cat > firmware/README.txt <<'EOF'
           Userspace DVB firmware directory
           ================================
 
           Drop DVB chip-driver firmware blobs into this directory, then
-          run minisatip with FIRMWARE_DIR pointed at it:
+          run minisatip with --firmware-dir pointed at it:
 
-              FIRMWARE_DIR="$PWD/firmware" ./minisatip ...
+              ./minisatip --firmware-dir "$PWD/firmware" ...
+
+          ($FIRMWARE_DIR env var is also honored as a fallback if the
+          flag is not provided.)
 
           Commonly required firmware files (per supported chip family):
 
@@ -229,10 +233,10 @@ jobs:
           can omit FIRMWARE_DIR entirely.
           EOF
           ZIP_NAME="minisatip-userspace-dvb-${{ matrix.arch }}.zip"
-          # Bundle the binary, the html/ web-UI directory, and an
-          # empty (README-only) firmware/ dir so end users have a
-          # clear drop-in spot for chip-driver firmware blobs.
-          zip -9 -r "dist/$ZIP_NAME" build/minisatip html firmware
+          # Bundle the binary at the zip root (alongside the html/
+          # web-UI directory and a README-only firmware/ drop-in
+          # spot for chip-driver firmware blobs).
+          zip -9 -r "dist/$ZIP_NAME" minisatip html firmware
 
       - uses: actions/upload-artifact@v7
         with:
