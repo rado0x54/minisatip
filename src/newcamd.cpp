@@ -4,12 +4,15 @@
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License v2 or later.
  *
- * Status: M2/M3 skeleton. Lifecycle (TCP connect, reconnect, CA-PMT plumbing,
- * ECM filter install, CW delivery) is real and exercised. The wire-level
- * crypto (3DES key derivation, login handshake framing, ECM/CW message
- * encryption) is marked TODO(newcamd-wire) and must be filled in against
- * a known-good reference (vdr-plugin-newcamd / oscam) before this client
- * will actually descramble.
+ * Wire format references: OpenE2/CSP/etc/protocol.txt and the tsdecrypt
+ * project's camd-newcamd.c. We use OpenSSL's DES_ede2_cbc_encrypt for the
+ * standard EDE2-CBC framing — the protocol's three-stage description is
+ * literally what that function does internally.
+ *
+ * macOS-friendly: we don't rely on libc crypt(3) (which on macOS only
+ * implements legacy DES). md5_crypt_phk() below ports the Poul-Henning Kamp
+ * algorithm using OpenSSL MD5, so the "$1$abcdefgh$..." password hashing
+ * works on both Linux and macOS.
  */
 
 #ifndef DISABLE_NEWCAMD
@@ -29,48 +32,88 @@
 #include <string.h>
 #include <unistd.h>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#include <openssl/des.h>
+#include <openssl/md5.h>
+#include <openssl/rand.h>
+
 #define DEFAULT_LOG LOG_NEWCAMD
 
 #define NEWCAMD_DEFAULT_PORT 15050
 #define NEWCAMD_CONNECT_RETRY_MS 5000
-#define NEWCAMD_KEEPALIVE_IDLE_MS 60000
 #define NEWCAMD_DEAD_MS 240000
 
 #define MSG_CLIENT_2_SERVER_LOGIN 0xE0
 #define MSG_CLIENT_2_SERVER_LOGIN_ACK 0xE1
 #define MSG_CLIENT_2_SERVER_LOGIN_NAK 0xE2
-#define MSG_CARD_DATA_REQ 0xE4
-#define MSG_CARD_DATA 0xE5
-#define MSG_KEEPALIVE 0xFB
+#define MSG_CARD_DATA_REQ 0xE3
+#define MSG_CARD_DATA 0xE4
+#define MSG_KEEPALIVE 0xFD
 
-static int newcamd_enabled = 0;
-static char newcamd_host[100];
-static int newcamd_port = NEWCAMD_DEFAULT_PORT;
-static char newcamd_user[64];
-static char newcamd_pass[64];
-static uint8_t newcamd_deskey[NEWCAMD_DESKEY_LEN];
-static uint16_t newcamd_caids[MAX_NEWCAMD_CAIDS];
-static int newcamd_ncaids;
+#define NEWCAMD_CLIENT_ID 0x7878
 
-static SNewcamdConn *conns[MAX_NEWCAMD_CONNS];
-static int nconns;
+typedef struct struct_newcamd_endpoint {
+    char host[100];
+    int port;
+    char user[64];
+    char pass[64];
+    uint8_t deskey[NEWCAMD_DESKEY_LEN];
+} SNewcamdEndpoint;
 
-static SCA_op newcamd_ca_op;
-static int newcamd_ca_id = -1;
-static int newcamd_poller_sock = -1;
+typedef struct struct_newcamd_pending {
+    int in_use;
+    uint16_t msg_id;
+    int pmt_id;
+    int parity;
+    int filter_id;
+    int64_t sent;
+} SNewcamdPending;
 
-typedef struct struct_newcamd_key {
+typedef struct struct_newcamd_conn {
+    int idx;
+    int enabled;
+    int state;
+    int endpoint_idx;
+    int sock_id;
+    int fd;
+    uint16_t caid;
+    uint16_t msg_id;
+    int64_t last_rx;
+    int64_t last_connect_attempt;
+    char crypt_pw[128];
+    DES_key_schedule ks1, ks2;
+    SNewcamdPending pending[MAX_NEWCAMD_PENDING];
+    uint8_t rxbuf[NEWCAMD_MSG_SIZE * 2];
+} SNewcamdConn;
+
+static SNewcamdEndpoint endpoints[MAX_NEWCAMD_ENDPOINTS];
+static int nendpoints = 0;
+
+static SNewcamdConn *conns[MAX_NEWCAMD_ENDPOINTS];
+static int nconns = 0;
+static SMutex conns_mutex;
+
+typedef struct struct_newcamd_pmt_key {
     int conn_idx;
     int pmt_id;
     int adapter;
     int ecm_pid;
     int filter_id;
-} SNewcamdKey;
+    uint16_t sid;
+    int last_parity;
+} SNewcamdPmtKey;
 
-static SNewcamdKey *pmt_keys[MAX_NEWCAMD_CONNS * 64];
-static int npmt_keys;
+#define MAX_NEWCAMD_PMT_KEYS 256
+static SNewcamdPmtKey *pmt_keys[MAX_NEWCAMD_PMT_KEYS];
 
-int newcamd_configured() { return newcamd_enabled; }
+static SCA_op newcamd_ca_op;
+static int newcamd_ca_id = -1;
+static int newcamd_poller_sock = -1;
+
+int newcamd_configured() { return nendpoints > 0; }
+
+// ---------- hex parsing -----------------------------------------------------
 
 static int hex_nibble(char c) {
     if (c >= '0' && c <= '9')
@@ -93,178 +136,497 @@ static int parse_hex(const char *s, uint8_t *out, int len) {
     return 0;
 }
 
-void parse_newcamd_opt(char *optarg) {
-    // host:port:user:pass:deskey[:caid[,caid...]]
-    char buf[512];
-    safe_strncpy(buf, optarg);
+// ---------- md5-crypt ($1$) — Poul-Henning Kamp algo via OpenSSL MD5 --------
+// Produces "$1$<salt>$<hash>" matching glibc crypt(pw, "$1$<salt>$").
 
-    char *parts[6] = {NULL};
-    int n = 0;
-    char *p = buf;
-    while (n < 6 && p) {
-        parts[n++] = p;
-        char *colon = strchr(p, ':');
-        if (!colon)
-            break;
-        *colon = 0;
-        p = colon + 1;
+static const char itoa64[] =
+    "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+static void to64(char *s, unsigned long v, int n) {
+    while (--n >= 0) {
+        *s++ = itoa64[v & 0x3f];
+        v >>= 6;
     }
-    if (n < 5) {
-        LOG("newcamd: bad --newcamd arg; expected "
-            "host:port:user:pass:deskey[:caid[,caid...]]");
-        return;
-    }
-
-    safe_strncpy(newcamd_host, parts[0]);
-    newcamd_port = atoi(parts[1]);
-    if (newcamd_port <= 0)
-        newcamd_port = NEWCAMD_DEFAULT_PORT;
-    safe_strncpy(newcamd_user, parts[2]);
-    safe_strncpy(newcamd_pass, parts[3]);
-
-    if (strlen(parts[4]) != NEWCAMD_DESKEY_LEN * 2 ||
-        parse_hex(parts[4], newcamd_deskey, NEWCAMD_DESKEY_LEN) < 0) {
-        LOG("newcamd: deskey must be %d hex chars", NEWCAMD_DESKEY_LEN * 2);
-        return;
-    }
-
-    newcamd_ncaids = 0;
-    if (n >= 6 && parts[5] && parts[5][0]) {
-        char *caid_p = parts[5];
-        while (caid_p && newcamd_ncaids < MAX_NEWCAMD_CAIDS) {
-            char *comma = strchr(caid_p, ',');
-            if (comma)
-                *comma = 0;
-            newcamd_caids[newcamd_ncaids++] =
-                (uint16_t)strtoul(caid_p, NULL, 16);
-            caid_p = comma ? comma + 1 : NULL;
-        }
-    }
-
-    newcamd_enabled = 1;
-    LOG("newcamd: configured %s:%d user=%s caids=%d", newcamd_host,
-        newcamd_port, newcamd_user, newcamd_ncaids);
 }
 
-static SNewcamdConn *conn_for_caid(uint16_t caid) {
-    for (int i = 0; i < nconns; i++)
-        if (conns[i] && conns[i]->enabled && conns[i]->caid == caid)
-            return conns[i];
+static int md5_crypt_phk(const char *pw, const char *salt, char *out,
+                         int out_len) {
+    static const char *magic = "$1$";
+    const char *sp = salt;
+    if (!strncmp(sp, magic, strlen(magic)))
+        sp += strlen(magic);
+    const char *ep = sp;
+    while (*ep && *ep != '$' && (ep - sp) < 8)
+        ep++;
+    int sl = (int)(ep - sp);
+    int pwl = (int)strlen(pw);
+
+    MD5_CTX ctx, ctx1;
+    MD5_Init(&ctx);
+    MD5_Update(&ctx, pw, pwl);
+    MD5_Update(&ctx, magic, strlen(magic));
+    MD5_Update(&ctx, sp, sl);
+
+    MD5_Init(&ctx1);
+    MD5_Update(&ctx1, pw, pwl);
+    MD5_Update(&ctx1, sp, sl);
+    MD5_Update(&ctx1, pw, pwl);
+    unsigned char final_md[16];
+    MD5_Final(final_md, &ctx1);
+
+    for (int pl = pwl; pl > 0; pl -= 16)
+        MD5_Update(&ctx, final_md, pl > 16 ? 16 : pl);
+    memset(final_md, 0, sizeof(final_md));
+
+    for (int i = pwl; i; i >>= 1) {
+        if (i & 1)
+            MD5_Update(&ctx, final_md, 1);
+        else
+            MD5_Update(&ctx, pw, 1);
+    }
+    MD5_Final(final_md, &ctx);
+
+    for (int i = 0; i < 1000; i++) {
+        MD5_Init(&ctx1);
+        if (i & 1)
+            MD5_Update(&ctx1, pw, pwl);
+        else
+            MD5_Update(&ctx1, final_md, 16);
+        if (i % 3)
+            MD5_Update(&ctx1, sp, sl);
+        if (i % 7)
+            MD5_Update(&ctx1, pw, pwl);
+        if (i & 1)
+            MD5_Update(&ctx1, final_md, 16);
+        else
+            MD5_Update(&ctx1, pw, pwl);
+        MD5_Final(final_md, &ctx1);
+    }
+
+    int n = snprintf(out, out_len, "$1$%.*s$", sl, sp);
+    if (n < 0 || n + 22 + 1 > out_len)
+        return -1;
+    char *p = out + n;
+    unsigned long l;
+    l = (final_md[0] << 16) | (final_md[6] << 8) | final_md[12];
+    to64(p, l, 4);
+    p += 4;
+    l = (final_md[1] << 16) | (final_md[7] << 8) | final_md[13];
+    to64(p, l, 4);
+    p += 4;
+    l = (final_md[2] << 16) | (final_md[8] << 8) | final_md[14];
+    to64(p, l, 4);
+    p += 4;
+    l = (final_md[3] << 16) | (final_md[9] << 8) | final_md[15];
+    to64(p, l, 4);
+    p += 4;
+    l = (final_md[4] << 16) | (final_md[10] << 8) | final_md[5];
+    to64(p, l, 4);
+    p += 4;
+    l = final_md[11];
+    to64(p, l, 2);
+    p += 2;
+    *p = 0;
+    memset(final_md, 0, sizeof(final_md));
+    return 0;
+}
+
+// ---------- newcamd key derivation -----------------------------------------
+
+static void set_odd_parity(uint8_t *key) {
+    DES_set_odd_parity((DES_cblock *)&key[0]);
+    DES_set_odd_parity((DES_cblock *)&key[8]);
+}
+
+static void des_key_spread(uint8_t *spread, const uint8_t *normal) {
+    spread[0] = normal[0] & 0xfe;
+    spread[1] = ((normal[0] << 7) | (normal[1] >> 1)) & 0xfe;
+    spread[2] = ((normal[1] << 6) | (normal[2] >> 2)) & 0xfe;
+    spread[3] = ((normal[2] << 5) | (normal[3] >> 3)) & 0xfe;
+    spread[4] = ((normal[3] << 4) | (normal[4] >> 4)) & 0xfe;
+    spread[5] = ((normal[4] << 3) | (normal[5] >> 5)) & 0xfe;
+    spread[6] = ((normal[5] << 2) | (normal[6] >> 6)) & 0xfe;
+    spread[7] = normal[6] << 1;
+    spread[8] = normal[7] & 0xfe;
+    spread[9] = ((normal[7] << 7) | (normal[8] >> 1)) & 0xfe;
+    spread[10] = ((normal[8] << 6) | (normal[9] >> 2)) & 0xfe;
+    spread[11] = ((normal[9] << 5) | (normal[10] >> 3)) & 0xfe;
+    spread[12] = ((normal[10] << 4) | (normal[11] >> 4)) & 0xfe;
+    spread[13] = ((normal[11] << 3) | (normal[12] >> 5)) & 0xfe;
+    spread[14] = ((normal[12] << 2) | (normal[13] >> 6)) & 0xfe;
+    spread[15] = normal[13] << 1;
+    set_odd_parity(spread);
+}
+
+static void schedule_key(SNewcamdConn *c, const uint8_t *spread16) {
+    DES_key_sched((const_DES_cblock *)&spread16[0], &c->ks1);
+    DES_key_sched((const_DES_cblock *)&spread16[8], &c->ks2);
+}
+
+static void set_login_key(SNewcamdConn *c, const uint8_t *server_rand) {
+    uint8_t tmp[14], spread[16];
+    const uint8_t *dk = endpoints[c->endpoint_idx].deskey;
+    for (int i = 0; i < 14; i++)
+        tmp[i] = server_rand[i] ^ dk[i];
+    des_key_spread(spread, tmp);
+    schedule_key(c, spread);
+}
+
+static void set_session_key(SNewcamdConn *c) {
+    uint8_t tmp[14], spread[16];
+    const uint8_t *dk = endpoints[c->endpoint_idx].deskey;
+    memcpy(tmp, dk, 14);
+    int crl = (int)strlen(c->crypt_pw);
+    for (int i = 0; i < crl; i++)
+        tmp[i % 14] ^= (uint8_t)c->crypt_pw[i];
+    des_key_spread(spread, tmp);
+    schedule_key(c, spread);
+}
+
+// ---------- send / receive --------------------------------------------------
+
+static uint8_t xor_sum(const uint8_t *p, int len) {
+    uint8_t cs = 0;
+    while (len-- > 0)
+        cs ^= *p++;
+    return cs;
+}
+
+static int pad_and_checksum(uint8_t *data, int len) {
+    DES_cblock pad;
+    int npad = (8 - ((len - 1) % 8)) % 8;
+    if (len + npad + 1 >= NEWCAMD_MSG_SIZE - 8)
+        return -1;
+    DES_random_key(&pad);
+    memcpy(data + len, pad, npad);
+    len += npad;
+    data[len] = xor_sum(data + 2, len - 2);
+    return len + 1;
+}
+
+static int newcamd_send_msg(SNewcamdConn *c, const uint8_t *payload,
+                            int payload_len, uint16_t sid, int use_msg_id) {
+    uint8_t buf[NEWCAMD_MSG_SIZE];
+
+    if (c->fd < 0)
+        return -1;
+    if (payload_len < 3 || payload_len + NEWCAMD_HDR_LEN + 4 > NEWCAMD_MSG_SIZE)
+        return -1;
+
+    memset(&buf[2], 0, NEWCAMD_HDR_LEN + 2);
+    memcpy(&buf[NEWCAMD_HDR_LEN + 4], payload, payload_len);
+    buf[NEWCAMD_HDR_LEN + 4 + 1] =
+        (payload[1] & 0xF0) | (((payload_len - 3) >> 8) & 0x0F);
+    buf[NEWCAMD_HDR_LEN + 4 + 2] = (payload_len - 3) & 0xFF;
+
+    int total = payload_len + 4;
+    buf[4] = sid >> 8;
+    buf[5] = sid & 0xFF;
+    total += NEWCAMD_HDR_LEN;
+
+    if (use_msg_id) {
+        c->msg_id++;
+        buf[2] = c->msg_id >> 8;
+        buf[3] = c->msg_id & 0xFF;
+    }
+
+    total = pad_and_checksum(buf, total);
+    if (total < 0)
+        return -1;
+
+    DES_cblock iv;
+    DES_random_key(&iv);
+    memcpy(buf + total, iv, sizeof(iv));
+    DES_ede2_cbc_encrypt(buf + 2, buf + 2, total - 2, &c->ks1, &c->ks2,
+                         (DES_cblock *)iv, DES_ENCRYPT);
+    total += sizeof(iv);
+    buf[0] = (total - 2) >> 8;
+    buf[1] = (total - 2) & 0xFF;
+
+    int w = write(c->fd, buf, total);
+    return (w == total) ? 0 : -1;
+}
+
+// Decrypts a complete framed message in-place and returns the
+// length of the inner payload (cmd + 12-bit length + data).
+// `wirebuf` includes the 2-byte length prefix.
+static int newcamd_decrypt_in_place(SNewcamdConn *c, uint8_t *wirebuf,
+                                    int wirelen, uint8_t *out_payload,
+                                    int max_out, uint16_t *out_msg_id) {
+    if (wirelen < 2)
+        return -1;
+    int body = ((wirebuf[0] << 8) | wirebuf[1]) & 0xFFFF;
+    if (body + 2 != wirelen)
+        return -1;
+    if ((body - 2) % 8 || (body - 2) < 16)
+        return -1;
+    DES_cblock iv;
+    int enc_end = wirelen - 8;
+    memcpy(iv, wirebuf + enc_end, 8);
+    DES_ede2_cbc_encrypt(wirebuf + 2, wirebuf + 2, enc_end - 2, &c->ks1,
+                         &c->ks2, (DES_cblock *)iv, DES_DECRYPT);
+    if (xor_sum(wirebuf + 2, enc_end - 2) != 0)
+        return -1;
+
+    int payload_off = 4 + NEWCAMD_HDR_LEN;
+    int len_off = 1 + NEWCAMD_HDR_LEN;
+    if (payload_off + 3 > enc_end)
+        return -1;
+    int paylen =
+        (((wirebuf[len_off + 1] & 0x0F) << 8) | wirebuf[len_off + 2]) + 3;
+    if (paylen > max_out || payload_off + paylen > enc_end)
+        return -1;
+    if (out_msg_id)
+        *out_msg_id = (wirebuf[2] << 8) | wirebuf[3];
+    memcpy(out_payload, wirebuf + payload_off, paylen);
+    return paylen;
+}
+
+// ---------- pending ECMs ---------------------------------------------------
+
+static SNewcamdPending *find_pending(SNewcamdConn *c, uint16_t msg_id) {
+    for (int i = 0; i < MAX_NEWCAMD_PENDING; i++)
+        if (c->pending[i].in_use && c->pending[i].msg_id == msg_id)
+            return &c->pending[i];
     return NULL;
 }
 
+static SNewcamdPending *alloc_pending(SNewcamdConn *c) {
+    for (int i = 0; i < MAX_NEWCAMD_PENDING; i++)
+        if (!c->pending[i].in_use)
+            return &c->pending[i];
+    return NULL;
+}
+
+static void clear_pending_for_filter(SNewcamdConn *c, int filter_id) {
+    for (int i = 0; i < MAX_NEWCAMD_PENDING; i++)
+        if (c->pending[i].in_use && c->pending[i].filter_id == filter_id)
+            c->pending[i].in_use = 0;
+}
+
+// ---------- protocol state machine -----------------------------------------
+
+static void newcamd_send_login(SNewcamdConn *c) {
+    SNewcamdEndpoint *e = &endpoints[c->endpoint_idx];
+    if (md5_crypt_phk(e->pass, "$1$abcdefgh$", c->crypt_pw,
+                       sizeof(c->crypt_pw)) < 0) {
+        LOG("newcamd[%d]: md5_crypt failed", c->idx);
+        return;
+    }
+    int userLen = (int)strlen(e->user) + 1;
+    int passLen = (int)strlen(c->crypt_pw) + 1;
+    uint8_t buf[NEWCAMD_MSG_SIZE];
+    buf[0] = MSG_CLIENT_2_SERVER_LOGIN;
+    buf[1] = 0;
+    buf[2] = (uint8_t)(userLen + passLen);
+    memcpy(&buf[3], e->user, userLen);
+    memcpy(&buf[3 + userLen], c->crypt_pw, passLen);
+
+    c->msg_id = 0;
+    if (newcamd_send_msg(c, buf, buf[2] + 3, NEWCAMD_CLIENT_ID, 1) < 0) {
+        LOG("newcamd[%d]: failed to send LOGIN", c->idx);
+        return;
+    }
+    c->state = NEWCAMD_STATE_LOGIN_SENT;
+    LOG("newcamd[%d]: LOGIN sent user=%s", c->idx, e->user);
+}
+
+static void newcamd_send_card_data_req(SNewcamdConn *c) {
+    uint8_t buf[3] = {MSG_CARD_DATA_REQ, 0, 0};
+    if (newcamd_send_msg(c, buf, 3, 0, 0) < 0) {
+        LOG("newcamd[%d]: failed to send CARD_DATA_REQ", c->idx);
+        return;
+    }
+    c->state = NEWCAMD_STATE_CARD_DATA_SENT;
+    LOG("newcamd[%d]: CARD_DATA_REQ sent", c->idx);
+}
+
+static void newcamd_close_conn(SNewcamdConn *c, const char *reason);
+
+static void newcamd_on_login_rand(SNewcamdConn *c, const uint8_t *rand14) {
+    set_login_key(c, rand14);
+    newcamd_send_login(c);
+}
+
+static void newcamd_handle_card_data(SNewcamdConn *c, const uint8_t *payload,
+                                     int len) {
+    if (len < 7) {
+        LOG("newcamd[%d]: CARD_DATA too short (%d)", c->idx, len);
+        newcamd_close_conn(c, "short card_data");
+        return;
+    }
+    uint16_t caid = ((uint16_t)payload[4] << 8) | payload[5];
+    int admin = payload[3];
+    int nprov = (len > 11) ? payload[11] : 0;
+    c->caid = caid;
+    c->state = NEWCAMD_STATE_READY;
+    LOG("newcamd[%d]: READY caid=%04X admin=%d providers=%d", c->idx, caid,
+        admin, nprov);
+}
+
+static void newcamd_handle_ecm_reply(SNewcamdConn *c, uint16_t msg_id,
+                                     const uint8_t *payload, int len) {
+    SNewcamdPending *p = find_pending(c, msg_id);
+    if (!p) {
+        LOGM("newcamd[%d]: stray ECM reply msg_id=%04X", c->idx, msg_id);
+        return;
+    }
+    p->in_use = 0;
+    if (len == 19 && (payload[0] == 0x80 || payload[0] == 0x81)) {
+        SPMT *pmt = get_pmt(p->pmt_id);
+        if (!pmt) {
+            LOG("newcamd[%d]: ECM CW for stale pmt %d", c->idx, p->pmt_id);
+            return;
+        }
+        const uint8_t *cw_even = payload + 3;
+        const uint8_t *cw_odd = payload + 3 + 8;
+        uint8_t cw16[16];
+        memcpy(cw16, cw_even, 8);
+        memcpy(cw16 + 8, cw_odd, 8);
+        send_cw(p->pmt_id, CA_ALGO_DVBCSA, p->parity,
+                p->parity ? cw16 + 8 : cw16, NULL, 0, c);
+        LOGM("newcamd[%d]: CW pmt=%d parity=%d", c->idx, p->pmt_id, p->parity);
+    } else if (len == 3) {
+        LOGM("newcamd[%d]: card couldn't decode (pmt=%d)", c->idx, p->pmt_id);
+    } else {
+        LOG("newcamd[%d]: unexpected ECM reply len=%d", c->idx, len);
+    }
+}
+
+static int newcamd_process_one(SNewcamdConn *c, uint8_t *wirebuf, int wirelen) {
+    uint8_t payload[NEWCAMD_MSG_SIZE];
+    uint16_t msg_id = 0;
+    int plen =
+        newcamd_decrypt_in_place(c, wirebuf, wirelen, payload, sizeof(payload),
+                                  &msg_id);
+    if (plen < 1) {
+        LOG("newcamd[%d]: decrypt failed (state=%d, wire=%d)", c->idx, c->state,
+            wirelen);
+        newcamd_close_conn(c, "bad packet");
+        return -1;
+    }
+    uint8_t cmd = payload[0];
+
+    switch (c->state) {
+    case NEWCAMD_STATE_LOGIN_SENT:
+        if (cmd == MSG_CLIENT_2_SERVER_LOGIN_ACK) {
+            set_session_key(c);
+            newcamd_send_card_data_req(c);
+        } else {
+            LOG("newcamd[%d]: LOGIN rejected (cmd=%02X)", c->idx, cmd);
+            newcamd_close_conn(c, "login nak");
+        }
+        break;
+    case NEWCAMD_STATE_CARD_DATA_SENT:
+        if (cmd == MSG_CARD_DATA) {
+            newcamd_handle_card_data(c, payload, plen);
+        } else {
+            LOG("newcamd[%d]: expected CARD_DATA got %02X", c->idx, cmd);
+            newcamd_close_conn(c, "no card_data");
+        }
+        break;
+    case NEWCAMD_STATE_READY:
+        if (cmd == 0x80 || cmd == 0x81) {
+            newcamd_handle_ecm_reply(c, msg_id, payload, plen);
+        } else if (cmd == MSG_KEEPALIVE) {
+            uint8_t ka[3] = {MSG_KEEPALIVE, 0, 0};
+            newcamd_send_msg(c, ka, 3, 0, 0);
+        } else {
+            LOGM("newcamd[%d]: unhandled cmd %02X in READY", c->idx, cmd);
+        }
+        break;
+    default:
+        LOG("newcamd[%d]: unexpected packet in state %d", c->idx, c->state);
+        break;
+    }
+    return 0;
+}
+
+// ---------- socketworks callbacks ------------------------------------------
+
 static void newcamd_close_conn(SNewcamdConn *c, const char *reason) {
-    LOG("newcamd: closing conn for caid %04X (%s)", c->caid, reason);
+    LOG("newcamd[%d]: closing (%s)", c->idx, reason);
+    std::lock_guard<SMutex> lock(conns_mutex);
     if (c->sock_id >= 0)
         sockets_del(c->sock_id);
     c->sock_id = -1;
     c->fd = -1;
     c->state = NEWCAMD_STATE_DISCONNECTED;
+    c->msg_id = 0;
+    c->caid = 0;
     memset(c->pending, 0, sizeof(c->pending));
 }
 
-static int newcamd_sock_close(sockets *s) {
+static SNewcamdConn *conn_for_sock(int sock_id) {
     for (int i = 0; i < nconns; i++)
-        if (conns[i] && conns[i]->sock_id == s->id) {
-            conns[i]->fd = -1;
-            conns[i]->sock_id = -1;
-            conns[i]->state = NEWCAMD_STATE_DISCONNECTED;
-            return 0;
-        }
+        if (conns[i] && conns[i]->sock_id == sock_id)
+            return conns[i];
+    return NULL;
+}
+
+static int newcamd_sock_close(sockets *s) {
+    SNewcamdConn *c = conn_for_sock(s->id);
+    if (c) {
+        c->fd = -1;
+        c->sock_id = -1;
+        c->state = NEWCAMD_STATE_DISCONNECTED;
+        c->caid = 0;
+        memset(c->pending, 0, sizeof(c->pending));
+    }
     return 0;
 }
 
 static int newcamd_sock_timeout(sockets *s) {
-    for (int i = 0; i < nconns; i++)
-        if (conns[i] && conns[i]->sock_id == s->id) {
-            int64_t now = getTick();
-            if (conns[i]->last_rx > 0 &&
-                now - conns[i]->last_rx > NEWCAMD_DEAD_MS) {
-                newcamd_close_conn(conns[i], "rx idle");
-            }
-            return 0;
-        }
-    return 0;
-}
-
-// TODO(newcamd-wire): real Triple-DES session key derivation.
-// Reference: vdr-plugin-newcamd / oscam module_newcamd.c (key_*).
-// The 14-byte configured deskey is expanded with parity to 16 bytes
-// (DES_ede2 key1 || key2), then mixed with the server's 14 random
-// "login key" bytes received on connect. This stub leaves session_key
-// as the raw deskey + 2 zero bytes — it WILL NOT successfully
-// authenticate against a real oscam.
-[[maybe_unused]] static void derive_session_key(SNewcamdConn *c, const uint8_t *login_random,
-                               int login_random_len) {
-    (void)login_random;
-    (void)login_random_len;
-    memcpy(c->session_key, newcamd_deskey, NEWCAMD_DESKEY_LEN);
-    c->session_key[14] = 0;
-    c->session_key[15] = 0;
-}
-
-// TODO(newcamd-wire): real framing + Triple-DES-EDE2-CBC encrypt.
-// For now this is a stub so the lifecycle compiles. Real implementation:
-//   - prepend 3-byte (msg_id, len_hi, len_lo) header
-//   - pad to 8-byte block
-//   - 3DES-EDE2-CBC encrypt with c->session_key
-//   - prepend 2-byte BE length
-[[maybe_unused]] static int newcamd_send_msg(SNewcamdConn *c, uint8_t msg_id,
-                            const uint8_t *payload, int len) {
-    (void)c;
-    (void)msg_id;
-    (void)payload;
-    (void)len;
-    LOGM("newcamd: send_msg stub (msg %02X, len %d)", msg_id, len);
-    return -1;
-}
-
-// TODO(newcamd-wire): real framing + decrypt.
-[[maybe_unused]] static int newcamd_recv_msg(SNewcamdConn *c, uint8_t *out_msg_id,
-                            uint8_t *out_payload, int max_len) {
-    (void)c;
-    (void)out_msg_id;
-    (void)out_payload;
-    (void)max_len;
-    return -1;
-}
-
-[[maybe_unused]] static int newcamd_send_login(SNewcamdConn *c) {
-    // TODO(newcamd-wire): build login payload:
-    //   user '\0' crypt_md5(pass, "$1$abcdefgh$") '\0'
-    // then newcamd_send_msg(c, MSG_CLIENT_2_SERVER_LOGIN, payload, len)
-    LOG("newcamd: would send LOGIN for caid %04X user=%s", c->caid,
-        newcamd_user);
-    c->state = NEWCAMD_STATE_LOGIN_SENT;
-    return 0;
-}
-
-[[maybe_unused]] static int newcamd_send_card_data_req(SNewcamdConn *c) {
-    // TODO(newcamd-wire): newcamd_send_msg(c, MSG_CARD_DATA_REQ, NULL, 0)
-    LOG("newcamd: would send CARD_DATA_REQ for caid %04X", c->caid);
-    c->state = NEWCAMD_STATE_CARD_DATA_SENT;
+    SNewcamdConn *c = conn_for_sock(s->id);
+    if (!c)
+        return 0;
+    int64_t now = getTick();
+    if (c->state >= NEWCAMD_STATE_READY && c->last_rx > 0 &&
+        now - c->last_rx > NEWCAMD_DEAD_MS) {
+        newcamd_close_conn(c, "rx idle");
+    }
     return 0;
 }
 
 static int newcamd_sock_reply(sockets *s) {
-    // TODO(newcamd-wire): drain s->buf into framed/encrypted messages,
-    // decrypt, dispatch:
-    //   - first message (cleartext) on connect: 14-byte login random ->
-    //     derive_session_key() then newcamd_send_login()
-    //   - MSG_CLIENT_2_SERVER_LOGIN_ACK -> newcamd_send_card_data_req()
-    //   - MSG_CARD_DATA -> state = READY
-    //   - ECM reply -> match pending by seq, call send_cw()
-    //   - MSG_KEEPALIVE -> reply with MSG_KEEPALIVE
-    SNewcamdConn *c = NULL;
-    for (int i = 0; i < nconns; i++)
-        if (conns[i] && conns[i]->sock_id == s->id) {
-            c = conns[i];
-            break;
-        }
+    SNewcamdConn *c = conn_for_sock(s->id);
     if (!c)
         return 0;
+    if (s->rlen == 0)
+        return 0; // connect completion, nothing yet
     c->last_rx = getTick();
-    s->rlen = 0; // drain stub — real impl will parse and consume
+
+    // CONNECTING transitions to AWAITING_RAND on first byte.
+    if (c->state == NEWCAMD_STATE_CONNECTING)
+        c->state = NEWCAMD_STATE_AWAITING_RAND;
+
+    // Initial 14-byte cleartext server random has no length prefix.
+    if (c->state == NEWCAMD_STATE_AWAITING_RAND) {
+        if (s->rlen < 14)
+            return 0;
+        uint8_t rand14[14];
+        memcpy(rand14, s->buf, 14);
+        memmove(s->buf, s->buf + 14, s->rlen - 14);
+        s->rlen -= 14;
+        newcamd_on_login_rand(c, rand14);
+        if (s->rlen == 0)
+            return 0;
+        // fall through — more data may already be queued
+    }
+
+    while (s->rlen >= 2) {
+        int body = ((s->buf[0] << 8) | s->buf[1]) & 0xFFFF;
+        if (body + 2 > (int)sizeof(c->rxbuf)) {
+            newcamd_close_conn(c, "oversized packet");
+            return 0;
+        }
+        if (s->rlen < body + 2)
+            break; // wait for more
+        if (newcamd_process_one(c, s->buf, body + 2) < 0)
+            return 0; // conn closed
+        memmove(s->buf, s->buf + body + 2, s->rlen - (body + 2));
+        s->rlen -= (body + 2);
+    }
     return 0;
 }
 
@@ -276,10 +638,10 @@ static int newcamd_connect_one(SNewcamdConn *c) {
         return 0;
     c->last_connect_attempt = now;
 
-    int fd = tcp_connect(newcamd_host, newcamd_port, NULL, 0);
+    SNewcamdEndpoint *e = &endpoints[c->endpoint_idx];
+    int fd = tcp_connect(e->host, e->port, NULL, 0);
     if (fd < 0) {
-        LOG("newcamd: tcp connect %s:%d failed (caid %04X)", newcamd_host,
-            newcamd_port, c->caid);
+        LOG("newcamd[%d]: tcp_connect %s:%d failed", c->idx, e->host, e->port);
         return -1;
     }
     int sid =
@@ -291,65 +653,93 @@ static int newcamd_connect_one(SNewcamdConn *c) {
         close(fd);
         return -1;
     }
+    set_socket_buffer(sid, c->rxbuf, sizeof(c->rxbuf));
     sockets_timeout(sid, 5000);
     c->fd = fd;
     c->sock_id = sid;
     c->state = NEWCAMD_STATE_CONNECTING;
     c->last_rx = now;
-    LOG("newcamd: connecting %s:%d for caid %04X", newcamd_host, newcamd_port,
-        c->caid);
+    LOG("newcamd[%d]: connecting %s:%d", c->idx, e->host, e->port);
     return 0;
 }
 
 static int newcamd_poller(void *arg) {
     (void)arg;
-    if (!newcamd_enabled)
-        return 0;
     for (int i = 0; i < nconns; i++)
         if (conns[i] && conns[i]->enabled)
             newcamd_connect_one(conns[i]);
     return 0;
 }
 
+// ---------- ECM filter callback + CA hooks ---------------------------------
+
+static SNewcamdConn *conn_for_caid_locked(uint16_t caid) {
+    for (int i = 0; i < nconns; i++)
+        if (conns[i] && conns[i]->state == NEWCAMD_STATE_READY &&
+            conns[i]->caid == caid)
+            return conns[i];
+    return NULL;
+}
+
 static int newcamd_ecm_cb(int filter_id, void *buf_v, int len, void *opaque) {
     uint8_t *b = (uint8_t *)buf_v;
-    SNewcamdKey *k = (SNewcamdKey *)opaque;
+    SNewcamdPmtKey *k = (SNewcamdPmtKey *)opaque;
     if (!k || k->filter_id != filter_id)
+        return 0;
+    if (len < 3 || (b[0] != 0x80 && b[0] != 0x81))
         return 0;
     SNewcamdConn *c = (k->conn_idx >= 0 && k->conn_idx < nconns)
                           ? conns[k->conn_idx]
                           : NULL;
     if (!c || c->state != NEWCAMD_STATE_READY)
         return 0;
-    if (len < 3 || (b[0] != 0x80 && b[0] != 0x81))
+
+    int parity = b[0] & 1;
+    if (parity == k->last_parity)
         return 0;
 
-    // TODO(newcamd-wire): build ECM request frame: 12-byte newcamd header
-    //   (seq, sid, capid, pid, ...) + ECM section bytes; encrypt; send.
-    //   Record pending[seq] = (pmt_id, parity, filter_id).
-    c->seq++;
-    LOGM("newcamd: ECM seq=%u caid=%04X pmt=%d parity=%d len=%d", c->seq,
-         c->caid, k->pmt_id, b[0] & 1, len);
+    int ecm_len = (((b[1] & 0x0F) << 8) | b[2]) + 3;
+    if (ecm_len > len || ecm_len > NEWCAMD_MSG_SIZE - 32)
+        return 0;
+
+    std::lock_guard<SMutex> lock(conns_mutex);
+    if (newcamd_send_msg(c, b, ecm_len, k->sid, 1) < 0) {
+        LOG("newcamd[%d]: send ECM failed (pmt=%d)", c->idx, k->pmt_id);
+        return 0;
+    }
+    SNewcamdPending *p = alloc_pending(c);
+    if (p) {
+        p->in_use = 1;
+        p->msg_id = c->msg_id;
+        p->pmt_id = k->pmt_id;
+        p->parity = parity;
+        p->filter_id = filter_id;
+        p->sent = getTick();
+    }
+    k->last_parity = parity;
+    LOGM("newcamd[%d]: ECM pmt=%d caid=%04X sid=%04X parity=%d len=%d msg_id=%04X",
+         c->idx, k->pmt_id, c->caid, k->sid, parity, ecm_len, c->msg_id);
     return 0;
 }
 
-static SNewcamdKey *alloc_pmt_key() {
-    for (int i = 0; i < (int)(sizeof(pmt_keys) / sizeof(pmt_keys[0])); i++)
+static SNewcamdPmtKey *alloc_pmt_key() {
+    for (int i = 0; i < MAX_NEWCAMD_PMT_KEYS; i++)
         if (!pmt_keys[i]) {
-            pmt_keys[i] = (SNewcamdKey *)calloc(1, sizeof(SNewcamdKey));
-            if (i >= npmt_keys)
-                npmt_keys = i + 1;
+            pmt_keys[i] = (SNewcamdPmtKey *)calloc(1, sizeof(SNewcamdPmtKey));
             return pmt_keys[i];
         }
     return NULL;
 }
 
-static void free_pmt_key(SNewcamdKey *k) {
+static void free_pmt_key(SNewcamdPmtKey *k) {
     if (!k)
         return;
-    if (k->filter_id >= 0)
+    if (k->filter_id >= 0) {
+        if (k->conn_idx >= 0 && k->conn_idx < nconns && conns[k->conn_idx])
+            clear_pending_for_filter(conns[k->conn_idx], k->filter_id);
         del_filter(k->filter_id);
-    for (int i = 0; i < npmt_keys; i++)
+    }
+    for (int i = 0; i < MAX_NEWCAMD_PMT_KEYS; i++)
         if (pmt_keys[i] == k) {
             pmt_keys[i] = NULL;
             break;
@@ -358,34 +748,28 @@ static void free_pmt_key(SNewcamdKey *k) {
 }
 
 static int newcamd_ca_add_pmt(adapter *ad, SPMT *pmt) {
-    if (!newcamd_enabled)
+    if (nconns == 0)
         return TABLES_RESULT_ERROR_NORETRY;
 
+    std::lock_guard<SMutex> lock(conns_mutex);
     for (int i = 0; i < pmt->caids; i++) {
         SPMTCA *ca = pmt->ca[i];
         if (!ca)
             continue;
-        SNewcamdConn *c = conn_for_caid(ca->id);
+        SNewcamdConn *c = conn_for_caid_locked(ca->id);
         if (!c)
             continue;
-        if (c->state != NEWCAMD_STATE_READY) {
-            LOG("newcamd: conn for caid %04X not ready (state %d), retry",
-                ca->id, c->state);
-            return TABLES_RESULT_ERROR_RETRY;
-        }
 
-        SNewcamdKey *k = alloc_pmt_key();
+        SNewcamdPmtKey *k = alloc_pmt_key();
         if (!k)
             return TABLES_RESULT_ERROR_NORETRY;
-        k->conn_idx = -1;
-        for (int j = 0; j < nconns; j++)
-            if (conns[j] == c) {
-                k->conn_idx = j;
-                break;
-            }
+        k->conn_idx = c->idx;
         k->pmt_id = pmt->id;
         k->adapter = ad->id;
         k->ecm_pid = ca->pid;
+        k->sid = pmt->sid;
+        k->last_parity = -1;
+        k->filter_id = -1;
 
         uint8_t flt[FILTER_SIZE] = {0x80};
         uint8_t msk[FILTER_SIZE] = {0xFE};
@@ -397,16 +781,20 @@ static int newcamd_ca_add_pmt(adapter *ad, SPMT *pmt) {
             return TABLES_RESULT_ERROR_NORETRY;
         }
         pmt->opaque = k;
-        LOG("newcamd: ca_add_pmt pmt=%d caid=%04X ecm_pid=%d filter=%d",
-            pmt->id, ca->id, ca->pid, k->filter_id);
+        LOG("newcamd[%d]: ca_add_pmt pmt=%d caid=%04X sid=%04X ecm_pid=%d",
+            c->idx, pmt->id, ca->id, pmt->sid, ca->pid);
         return TABLES_RESULT_OK;
     }
+    // No conn ready for any of this PMT's CAIDs yet — retry later.
+    for (int i = 0; i < nconns; i++)
+        if (conns[i] && conns[i]->state != NEWCAMD_STATE_READY)
+            return TABLES_RESULT_ERROR_RETRY;
     return TABLES_RESULT_ERROR_NORETRY;
 }
 
 static int newcamd_ca_del_pmt(adapter *ad, SPMT *pmt) {
     (void)ad;
-    SNewcamdKey *k = (SNewcamdKey *)pmt->opaque;
+    SNewcamdPmtKey *k = (SNewcamdPmtKey *)pmt->opaque;
     if (k) {
         LOG("newcamd: ca_del_pmt pmt=%d", pmt->id);
         free_pmt_key(k);
@@ -422,26 +810,69 @@ static int newcamd_ca_init_dev(adapter *ad) {
     return TABLES_RESULT_OK;
 }
 
-void init_newcamd() {
-    if (!newcamd_enabled)
-        return;
+// ---------- CLI parsing & init ---------------------------------------------
 
-    int want_caids = newcamd_ncaids;
-    if (want_caids <= 0) {
-        LOG("newcamd: no CAIDs configured, idle (will not bring up any conn)");
+void parse_newcamd_opt(char *optarg) {
+    // host:port:user:pass:deskey
+    if (nendpoints >= MAX_NEWCAMD_ENDPOINTS) {
+        LOG("newcamd: too many --newcamd entries (max %d)",
+            MAX_NEWCAMD_ENDPOINTS);
+        return;
+    }
+    char buf[512];
+    safe_strncpy(buf, optarg);
+
+    char *parts[5] = {NULL};
+    int n = 0;
+    char *p = buf;
+    while (n < 5 && p) {
+        parts[n++] = p;
+        char *colon = strchr(p, ':');
+        if (!colon)
+            break;
+        *colon = 0;
+        p = colon + 1;
+    }
+    if (n < 5) {
+        LOG("newcamd: bad --newcamd arg; expected "
+            "host:port:user:pass:deskey");
         return;
     }
 
+    SNewcamdEndpoint *e = &endpoints[nendpoints];
+    safe_strncpy(e->host, parts[0]);
+    e->port = atoi(parts[1]);
+    if (e->port <= 0)
+        e->port = NEWCAMD_DEFAULT_PORT;
+    safe_strncpy(e->user, parts[2]);
+    safe_strncpy(e->pass, parts[3]);
+
+    if (strlen(parts[4]) != NEWCAMD_DESKEY_LEN * 2 ||
+        parse_hex(parts[4], e->deskey, NEWCAMD_DESKEY_LEN) < 0) {
+        LOG("newcamd: deskey must be %d hex chars", NEWCAMD_DESKEY_LEN * 2);
+        return;
+    }
+
+    LOG("newcamd[%d]: configured %s:%d user=%s", nendpoints, e->host, e->port,
+        e->user);
+    nendpoints++;
+}
+
+void init_newcamd() {
+    if (nendpoints == 0)
+        return;
+
     nconns = 0;
-    for (int i = 0; i < want_caids && nconns < MAX_NEWCAMD_CONNS; i++) {
+    for (int i = 0; i < nendpoints; i++) {
         SNewcamdConn *c = (SNewcamdConn *)calloc(1, sizeof(SNewcamdConn));
         if (!c)
             break;
+        c->idx = nconns;
+        c->endpoint_idx = i;
         c->enabled = 1;
         c->state = NEWCAMD_STATE_DISCONNECTED;
         c->sock_id = -1;
         c->fd = -1;
-        c->caid = newcamd_caids[i];
         conns[nconns++] = c;
     }
 
@@ -451,8 +882,9 @@ void init_newcamd() {
     newcamd_ca_op.ca_del_pmt = newcamd_ca_del_pmt;
     newcamd_ca_id = add_ca(&newcamd_ca_op);
 
-    newcamd_poller_sock = sockets_add(SOCK_TIMEOUT, NULL, -1, TYPE_UDP, NULL,
-                                       NULL, (socket_action)newcamd_poller);
+    newcamd_poller_sock =
+        sockets_add(SOCK_TIMEOUT, NULL, -1, TYPE_UDP, NULL, NULL,
+                    (socket_action)newcamd_poller);
     if (newcamd_poller_sock >= 0)
         sockets_timeout(newcamd_poller_sock, 1000);
     set_sockets_rtime(newcamd_poller_sock, -1000);
@@ -460,4 +892,5 @@ void init_newcamd() {
     LOG("newcamd: initialized, %d conn(s), ca_id=%d", nconns, newcamd_ca_id);
 }
 
+#pragma GCC diagnostic pop
 #endif // !DISABLE_NEWCAMD

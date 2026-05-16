@@ -466,8 +466,8 @@ Help\n\
 #endif
 #ifndef DISABLE_NEWCAMD
         "\
-* --newcamd host:port:user:pass:deskey[:caid[,caid...]] - connect to oscam via newcamd. One TCP conn opens per CAID (newcamd binds one CAID per conn at login). deskey is the 28-hex-char DES key from oscam [newcamd] config.\n\
-	* eg: --newcamd 192.168.1.10:15050:user:pass:0102030405060708091011121314:0500,0604\n\
+* --newcamd host:port:user:pass:deskey - connect to oscam via newcamd. Repeatable: each --newcamd opens one TCP connection to one oscam newcamd reader (one port = one CAID, learned at login). deskey is the 28-hex-char DES key from oscam [newcamd] config.\n\
+	* eg: --newcamd 192.168.1.10:15050:user:pass:0102030405060708091011121314\n\
 \n\
 "
 #endif

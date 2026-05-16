@@ -179,16 +179,22 @@ existing `ca_mask` machinery.
 
 - [x] M0  Map integration surface — done.
 - [x] M1  Plan (this doc) on `feat/newcamd`.
-- [ ] M2  Skeleton: `newcamd.h/.cpp`, `SCA_op` registration, CLI plumbing,
+- [x] M2  Skeleton: `newcamd.h/.cpp`, `SCA_op` registration, CLI plumbing,
           `init_newcamd()` called from `tables_init()`, build option,
           compiles clean on macOS *and* Linux.
-- [ ] M3  Connect + login: TCP up, DES auth handshake, `CARD_DATA`
-          exchange, log the CAID/serial oscam reports.
-- [ ] M4  ECM/CW round-trip: filter install, request frame, response
-          parse, `send_cw()` call. Single-CAID happy path.
-- [ ] M5  Multi-CAID + multi-reader, reconnect/keepalive, error paths.
+- [x] M3+M4  Connect + login + ECM/CW round-trip implemented in one pass
+             after the protocol-spec cross-check: state-machine driven login
+             (server-rand → login key → LOGIN → ACK → session key →
+             CARD_DATA), DES-EDE2-CBC framing with random IV + checksum,
+             repeatable `--newcamd` (one flag per port; CAID learned from
+             `MSG_CARD_DATA`), ECM filter install in `ca_add_pmt`,
+             `send_cw()` on CW reply. md5-crypt `$1$` reimplemented on top
+             of OpenSSL MD5 (verified against `openssl passwd -1`) so the
+             auth path works on macOS too.
+- [ ] M5  Live testing against a real oscam; reconnect & keepalive
+          hardening; provider id / EMM follow-ups.
 - [ ] M6  Tests under `tests/test_newcamd.cpp` (unit: DES key derivation,
-          frame round-trip; integration deferred — needs live oscam).
+          frame round-trip; integration needs live oscam).
 
 ## Open questions / non-goals (for now)
 
