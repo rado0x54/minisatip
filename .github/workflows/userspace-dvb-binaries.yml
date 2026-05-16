@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
 
 env:
-  DVB_LIBUSB_REF: v0.1.3
+  DVB_LIBUSB_REF: v0.1.4
   LIBUSB_VERSION: "1.0.27"
 
 jobs:
