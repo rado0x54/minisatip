@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version, e.g. v0.2.1 (must not already exist)'
+        description: 'Release version WITHOUT leading v, e.g. 0.2.1 (the tag v<version> must not already exist)'
         required: true
         type: string
 
@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.parse.outputs.version }}
+      tag:     ${{ steps.parse.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -35,19 +36,21 @@ jobs:
         run: |
           set -eu
           v="$INPUT_VERSION"
-          if ! [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::version must match v<MAJOR>.<MINOR>.<PATCH> — got '$v'"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be plain <MAJOR>.<MINOR>.<PATCH> with no leading v — got '$v'"
             exit 1
           fi
-          if git rev-parse --verify --quiet "refs/tags/$v" >/dev/null; then
-            echo "::error::tag $v already exists locally"
+          tag="v$v"
+          if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            echo "::error::tag $tag already exists locally"
             exit 1
           fi
-          if git ls-remote --exit-code --tags origin "refs/tags/$v" >/dev/null 2>&1; then
-            echo "::error::tag $v already exists on origin"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::tag $tag already exists on origin"
             exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   build:
     needs: validate
@@ -287,13 +290,13 @@ jobs:
 
       - name: Create and push tag
         env:
-          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -eu
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git tag -a "$VERSION" -m "$VERSION"
-          git push origin "$VERSION"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
 
       - uses: actions/download-artifact@v8
         with:
@@ -305,5 +308,5 @@ jobs:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: artifacts/*.zip
           file_glob: true
-          tag: ${{ needs.validate.outputs.version }}
+          tag: ${{ needs.validate.outputs.tag }}
           overwrite: true
