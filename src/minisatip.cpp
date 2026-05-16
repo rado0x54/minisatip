@@ -67,6 +67,10 @@
 #include "ca.h"
 #endif
 
+#ifndef DISABLE_NEWCAMD
+#include "newcamd.h"
+#endif
+
 #ifndef DISABLE_DDCI
 #include "ddci.h"
 #endif
@@ -143,6 +147,7 @@ int rtsp, http, si, si1, ssdp1;
 #define SATIPC_RECV_BUFFER_OPT (LONG_OPT_ONLY_START + 3)
 #define CLIENT_SEND_BUFFER_OPT (LONG_OPT_ONLY_START + 4)
 #define FIRMWARE_DIR_OPT (LONG_OPT_ONLY_START + 8)
+#define NEWCAMD_OPT (LONG_OPT_ONLY_START + 9)
 
 static const struct option long_options[] = {
     {"adapters", required_argument, NULL, ADAPTERS_OPT},
@@ -198,6 +203,9 @@ static const struct option long_options[] = {
 #ifndef DISABLE_DVBAPI
     {"dvbapi", required_argument, NULL, DVBAPI_OPT},
 #endif
+#ifndef DISABLE_NEWCAMD
+    {"newcamd", required_argument, NULL, NEWCAMD_OPT},
+#endif
 #ifndef DISABLE_SATIPCLIENT
     {"satip-servers", required_argument, NULL, SATIPCLIENT_OPT},
     {"satip-tcp", no_argument, NULL, SATIP_TCP_OPT},
@@ -233,6 +241,11 @@ const char *built_info[] = {
     "Built without dvbapi",
 #else
     "Built with dvbapi",
+#endif
+#ifdef DISABLE_NEWCAMD
+    "Built without newcamd",
+#else
+    "Built with newcamd",
 #endif
 #ifdef DISABLE_TABLES
     "Built without tables processing",
@@ -448,6 +461,13 @@ Help\n\
 	* eg: -o /tmp/camd.socket \n\
 	/tmp/camd.socket is the local socket that can be used \n\
 * --send-all-ecm Pass all received ECM to the DVBAPI server. Warning: This option may overload your server. Use with caution. Not necessary for regular use.\n\
+\n\
+"
+#endif
+#ifndef DISABLE_NEWCAMD
+        "\
+* --newcamd host:port:user:pass:deskey[:caid[,caid...]] - connect to oscam via newcamd. One TCP conn opens per CAID (newcamd binds one CAID per conn at login). deskey is the 28-hex-char DES key from oscam [newcamd] config.\n\
+	* eg: --newcamd 192.168.1.10:15050:user:pass:0102030405060708091011121314:0500,0604\n\
 \n\
 "
 #endif
@@ -1038,6 +1058,14 @@ void set_options(int argc, char *argv[]) {
 #endif
             break;
         }
+
+#ifndef DISABLE_NEWCAMD
+        case NEWCAMD_OPT: {
+            parse_newcamd_opt(optarg);
+            opts.newcamd_configured = newcamd_configured();
+            break;
+        }
+#endif
 
         case RTSPPORT_OPT: {
             opts.rtsp_port = atoi(optarg);

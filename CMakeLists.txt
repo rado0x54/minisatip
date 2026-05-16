@@ -36,6 +36,7 @@ project(minisatip VERSION 2.0 LANGUAGES CXX)
 set(DVBCSA_DEFAULT OFF)
 set(DVBCA_DEFAULT OFF)
 set(NETCVCLIENT_DEFAULT OFF)
+set(NEWCAMD_DEFAULT OFF)
 set(CXX23_DEFAULT OFF)
 
 # Detect available libraries for setting defaults
@@ -58,6 +59,7 @@ endif()
 
 if(CRYPTO_LIBRARY)
     set(DVBCA_DEFAULT ON)
+    set(NEWCAMD_DEFAULT ON)
 endif()
 
 if(NETCEIVER_LIBRARY AND NETCEIVER_INCLUDE_DIR)
@@ -74,6 +76,7 @@ endif()
 option(DVBCSA "Enable DVB-CSA support" ${DVBCSA_DEFAULT})
 option(DVBCA "Enable DVB-CA support" ${DVBCA_DEFAULT})
 option(NETCVCLIENT "Enable NetCeiver client support" ${NETCVCLIENT_DEFAULT})
+option(NEWCAMD "Enable newcamd descrambler client" ${NEWCAMD_DEFAULT})
 option(LINUXDVB "Enable Linux DVB support" ON)
 option(CXX23 "Enable C++23 features (stacktrace)" ${CXX23_DEFAULT})
 option(STATIC "Build with static linking" OFF)
@@ -88,6 +91,7 @@ if(APPLE)
     set(LINUXDVB OFF)
     set(DVBCA OFF)
     set(NETCVCLIENT OFF)
+    # NEWCAMD intentionally stays available on macOS — it only needs libcrypto.
 endif()
 
 # Compute derived feature flags
@@ -103,7 +107,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Generate config.h
-set(OPTIONS DVBCSA DVBCA NETCVCLIENT LINUXDVB DDCI CXX23 SRT USERSPACE_DVB HDHOMERUN)
+set(OPTIONS DVBCSA DVBCA NETCVCLIENT NEWCAMD LINUXDVB DDCI CXX23 SRT USERSPACE_DVB HDHOMERUN)
 set(CONFIG_CONTENT "// Auto-generated configuration header\n#ifndef CONFIG_H\n#define CONFIG_H\n\n")
 
 foreach(OPT ${OPTIONS})
@@ -197,6 +201,12 @@ endif()
 if(DVBCA)
     list(APPEND MINISATIP_SOURCES src/ca.cpp src/aes.cpp)
     list(APPEND MINISATIP_LIBS crypto dl)
+endif()
+if(NEWCAMD)
+    list(APPEND MINISATIP_SOURCES src/newcamd.cpp)
+    if(NOT DVBCA)
+        list(APPEND MINISATIP_LIBS ${CRYPTO_LIBRARY})
+    endif()
 endif()
 if(NETCVCLIENT)
     list(APPEND MINISATIP_SOURCES src/netceiver.cpp)
