@@ -9,19 +9,48 @@ name: Userspace DVB Binaries
 # to IOKit directly so udev is moot.
 
 on:
-  push:
-    branches: [ fork/main ]
-    tags: [ 'v*' ]
-  pull_request:
-    branches: [ fork/main ]
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. v0.2.1 (must not already exist)'
+        required: true
+        type: string
 
 env:
   DVB_LIBUSB_REF: v0.1.4
   LIBUSB_VERSION: "1.0.27"
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: parse
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          v="$INPUT_VERSION"
+          if ! [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must match v<MAJOR>.<MINOR>.<PATCH> — got '$v'"
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$v" >/dev/null; then
+            echo "::error::tag $v already exists locally"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$v" >/dev/null 2>&1; then
+            echo "::error::tag $v already exists on origin"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -244,14 +273,28 @@ jobs:
           path: dist/*.zip
 
   release:
-    needs: build
-    # Only publish a release when a tag is pushed on this fork.
-    # Upstream's existing release job keeps doing its own thing.
-    if: startsWith(github.ref, 'refs/tags/v') && github.repository_owner == 'rado0x54'
+    needs: [ validate, build ]
+    # Fork-only guard: keeps the workflow inert if anyone clones this
+    # repo and runs the dispatch under a different owner.
+    if: github.repository_owner == 'rado0x54'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create and push tag
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -eu
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "$VERSION"
+
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -262,5 +305,5 @@ jobs:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: artifacts/*.zip
           file_glob: true
-          tag: ${{ github.ref_name }}
+          tag: ${{ needs.validate.outputs.version }}
           overwrite: true
