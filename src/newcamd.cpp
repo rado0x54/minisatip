@@ -358,7 +358,7 @@ static int newcamd_decrypt_in_place(SNewcamdConn *c, uint8_t *wirebuf,
     int body = ((wirebuf[0] << 8) | wirebuf[1]) & 0xFFFF;
     if (body + 2 != wirelen)
         return -1;
-    if ((body - 2) % 8 || (body - 2) < 16)
+    if (body % 8 || body < 16)
         return -1;
     DES_cblock iv;
     int enc_end = wirelen - 8;
@@ -369,11 +369,11 @@ static int newcamd_decrypt_in_place(SNewcamdConn *c, uint8_t *wirebuf,
         return -1;
 
     int payload_off = 4 + NEWCAMD_HDR_LEN;
-    int len_off = 1 + NEWCAMD_HDR_LEN;
     if (payload_off + 3 > enc_end)
         return -1;
-    int paylen =
-        (((wirebuf[len_off + 1] & 0x0F) << 8) | wirebuf[len_off + 2]) + 3;
+    int paylen = (((wirebuf[payload_off + 1] & 0x0F) << 8) |
+                  wirebuf[payload_off + 2]) +
+                 3;
     if (paylen > max_out || payload_off + paylen > enc_end)
         return -1;
     if (out_msg_id)
