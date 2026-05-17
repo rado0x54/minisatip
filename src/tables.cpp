@@ -50,6 +50,10 @@
 #include "ca.h"
 #endif
 
+#ifndef DISABLE_NEWCAMD
+#include "newcamd.h"
+#endif
+
 #define DEFAULT_LOG LOG_TABLES
 
 SCA ca[MAX_CA];
@@ -325,6 +329,9 @@ int tables_init() {
 #endif
 #ifndef DISABLE_DVBAPI
     init_dvbapi();
+#endif
+#ifndef DISABLE_NEWCAMD
+    init_newcamd();
 #endif
     return 0;
 }
