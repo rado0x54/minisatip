@@ -4,10 +4,8 @@
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License v2 or later.
  *
- * Wire format references: OpenE2/CSP/etc/protocol.txt and the tsdecrypt
- * project's camd-newcamd.c. We use OpenSSL's DES_ede2_cbc_encrypt for the
- * standard EDE2-CBC framing — the protocol's three-stage description is
- * literally what that function does internally.
+ * Wire format: DES-EDE2-CBC framing over TCP per the public newcamd
+ * protocol description, using OpenSSL's DES_ede2_cbc_encrypt.
  *
  * macOS-friendly: we don't rely on libc crypt(3) (which on macOS only
  * implements legacy DES). md5_crypt_phk() below ports the Poul-Henning Kamp
@@ -55,7 +53,10 @@
 #define MSG_CARD_DATA 0xE4
 #define MSG_KEEPALIVE 0xFD
 
-#define NEWCAMD_CLIENT_ID 0x7878
+// LOGIN's customData.sid carries a client identifier that some cardservers
+// (oscam, etc.) translate to a friendly name in their logs. 0x0000 is the
+// "generic" entry in oscam's table — honest and accurate for us.
+#define NEWCAMD_CLIENT_ID 0x0000
 
 typedef struct struct_newcamd_endpoint {
     char host[100];
