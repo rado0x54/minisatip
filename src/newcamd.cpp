@@ -34,6 +34,10 @@
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+// The newcamd wire protocol mandates DES-EDE2-CBC framing — every DES_* call
+// below is protocol interop, not a chosen-cryptography decision. CodeQL flags
+// the symbols anyway; we silence each call site with an explicit
+// lgtm[cpp/weak-cryptographic-algorithm] annotation.
 #include <openssl/des.h>
 #include <openssl/md5.h>
 #include <openssl/rand.h>
@@ -238,8 +242,8 @@ static int md5_crypt_phk(const char *pw, const char *salt, char *out,
 // ---------- newcamd key derivation -----------------------------------------
 
 static void set_odd_parity(uint8_t *key) {
-    DES_set_odd_parity((DES_cblock *)&key[0]);
-    DES_set_odd_parity((DES_cblock *)&key[8]);
+    DES_set_odd_parity((DES_cblock *)&key[0]); // lgtm[cpp/weak-cryptographic-algorithm]
+    DES_set_odd_parity((DES_cblock *)&key[8]); // lgtm[cpp/weak-cryptographic-algorithm]
 }
 
 static void des_key_spread(uint8_t *spread, const uint8_t *normal) {
@@ -263,8 +267,8 @@ static void des_key_spread(uint8_t *spread, const uint8_t *normal) {
 }
 
 static void schedule_key(SNewcamdConn *c, const uint8_t *spread16) {
-    DES_key_sched((const_DES_cblock *)&spread16[0], &c->ks1);
-    DES_key_sched((const_DES_cblock *)&spread16[8], &c->ks2);
+    DES_key_sched((const_DES_cblock *)&spread16[0], &c->ks1); // lgtm[cpp/weak-cryptographic-algorithm]
+    DES_key_sched((const_DES_cblock *)&spread16[8], &c->ks2); // lgtm[cpp/weak-cryptographic-algorithm]
 }
 
 static void set_login_key(SNewcamdConn *c, const uint8_t *server_rand) {
@@ -272,7 +276,7 @@ static void set_login_key(SNewcamdConn *c, const uint8_t *server_rand) {
     const uint8_t *dk = endpoints[c->endpoint_idx].deskey;
     for (int i = 0; i < 14; i++)
         tmp[i] = server_rand[i] ^ dk[i];
-    des_key_spread(spread, tmp);
+    des_key_spread(spread, tmp); // lgtm[cpp/weak-cryptographic-algorithm]
     schedule_key(c, spread);
 }
 
@@ -283,7 +287,7 @@ static void set_session_key(SNewcamdConn *c) {
     int crl = (int)strlen(c->crypt_pw);
     for (int i = 0; i < crl; i++)
         tmp[i % 14] ^= (uint8_t)c->crypt_pw[i];
-    des_key_spread(spread, tmp);
+    des_key_spread(spread, tmp); // lgtm[cpp/weak-cryptographic-algorithm]
     schedule_key(c, spread);
 }
 
@@ -301,7 +305,7 @@ static int pad_and_checksum(uint8_t *data, int len) {
     int npad = (8 - ((len - 1) % 8)) % 8;
     if (len + npad + 1 >= NEWCAMD_MSG_SIZE - 8)
         return -1;
-    DES_random_key(&pad);
+    DES_random_key(&pad); // lgtm[cpp/weak-cryptographic-algorithm]
     memcpy(data + len, pad, npad);
     len += npad;
     data[len] = xor_sum(data + 2, len - 2);
@@ -339,10 +343,10 @@ static int newcamd_send_msg(SNewcamdConn *c, const uint8_t *payload,
         return -1;
 
     DES_cblock iv;
-    DES_random_key(&iv);
+    DES_random_key(&iv); // lgtm[cpp/weak-cryptographic-algorithm]
     memcpy(buf + total, iv, sizeof(iv));
     DES_ede2_cbc_encrypt(buf + 2, buf + 2, total - 2, &c->ks1, &c->ks2,
-                         (DES_cblock *)iv, DES_ENCRYPT);
+                         (DES_cblock *)iv, DES_ENCRYPT); // lgtm[cpp/weak-cryptographic-algorithm]
     total += sizeof(iv);
     buf[0] = (total - 2) >> 8;
     buf[1] = (total - 2) & 0xFF;
@@ -368,7 +372,7 @@ static int newcamd_decrypt_in_place(SNewcamdConn *c, uint8_t *wirebuf,
     int enc_end = wirelen - 8;
     memcpy(iv, wirebuf + enc_end, 8);
     DES_ede2_cbc_encrypt(wirebuf + 2, wirebuf + 2, enc_end - 2, &c->ks1,
-                         &c->ks2, (DES_cblock *)iv, DES_DECRYPT);
+                         &c->ks2, (DES_cblock *)iv, DES_DECRYPT); // lgtm[cpp/weak-cryptographic-algorithm]
     if (xor_sum(wirebuf + 2, enc_end - 2) != 0)
         return -1;
 
