@@ -572,6 +572,11 @@ static int newcamd_process_one(SNewcamdConn *c, uint8_t *wirebuf, int wirelen) {
         LOG("newcamd[%d]: unexpected packet in state %d", c->idx, c->state);
         break;
     }
+    // Any close path inside the switch (login NAK, missing CARD_DATA,
+    // short/invalid CARD_DATA) drops the conn and frees s->buf via
+    // sockets_del. Signal the caller to stop touching s->buf.
+    if (c->state == NEWCAMD_STATE_DISCONNECTED)
+        return -1;
     return 0;
 }
 
@@ -789,6 +794,12 @@ static void free_pmt_key(SNewcamdPmtKey *k) {
 
 static int newcamd_ca_add_pmt(adapter *ad, SPMT *pmt) {
     if (nconns == 0)
+        return TABLES_RESULT_ERROR_NORETRY;
+
+    // pmt->opaque is a single slot shared with dvbapi; if someone else
+    // already claimed this PMT (e.g. --dvbapi running alongside us),
+    // stand down so del_pmt doesn't try to free the wrong object.
+    if (pmt->opaque)
         return TABLES_RESULT_ERROR_NORETRY;
 
     // A PMT may list several CAIDs across providers; we pick the first one
