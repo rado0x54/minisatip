@@ -1063,7 +1063,6 @@ void set_options(int argc, char *argv[]) {
 #ifndef DISABLE_NEWCAMD
         case NEWCAMD_OPT: {
             parse_newcamd_opt(optarg);
-            opts.newcamd_configured = newcamd_configured();
             break;
         }
 #endif

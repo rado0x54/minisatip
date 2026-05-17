@@ -25,7 +25,6 @@
 #define NEWCAMD_STATE_READY 5
 
 void init_newcamd();
-int newcamd_configured();
 void parse_newcamd_opt(char *optarg);
 
 #endif // NEWCAMD_H

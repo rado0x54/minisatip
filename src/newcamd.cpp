@@ -82,6 +82,12 @@ typedef struct struct_newcamd_conn {
     int64_t last_rx;
     int64_t last_connect_attempt;
     char crypt_pw[128];
+    // ks1/ks2 are mutated by the socketworks thread during state transitions
+    // (set_login_key, set_session_key) and read by the AD0 thread inside
+    // newcamd_send_msg. Ordering invariant: state advances to READY *after*
+    // the session key is installed, and ECM filters that drive AD0 sends
+    // are only installed when state == READY (see ca_add_pmt). No lock
+    // required as long as that invariant holds.
     DES_key_schedule ks1, ks2;
     SNewcamdPending pending[MAX_NEWCAMD_PENDING];
     uint8_t rxbuf[NEWCAMD_MSG_SIZE * 2];
@@ -110,8 +116,6 @@ static SNewcamdPmtKey *pmt_keys[MAX_NEWCAMD_PMT_KEYS];
 static SCA_op newcamd_ca_op;
 static int newcamd_ca_id = -1;
 static int newcamd_poller_sock = -1;
-
-int newcamd_configured() { return nendpoints > 0; }
 
 // ---------- hex parsing -----------------------------------------------------
 
@@ -404,6 +408,19 @@ static void clear_pending_for_filter(SNewcamdConn *c, int filter_id) {
             c->pending[i].in_use = 0;
 }
 
+#define NEWCAMD_PENDING_TIMEOUT_MS 5000
+
+static void sweep_stale_pending(SNewcamdConn *c) {
+    int64_t now = getTick();
+    for (int i = 0; i < MAX_NEWCAMD_PENDING; i++)
+        if (c->pending[i].in_use &&
+            now - c->pending[i].sent > NEWCAMD_PENDING_TIMEOUT_MS) {
+            LOGM("newcamd[%d]: timing out stale pending msg_id=%04X pmt=%d",
+                 c->idx, c->pending[i].msg_id, c->pending[i].pmt_id);
+            c->pending[i].in_use = 0;
+        }
+}
+
 // ---------- protocol state machine -----------------------------------------
 
 static void newcamd_send_login(SNewcamdConn *c) {
@@ -423,7 +440,12 @@ static void newcamd_send_login(SNewcamdConn *c) {
     memcpy(&buf[3 + userLen], c->crypt_pw, passLen);
 
     c->msg_id = 0;
-    if (newcamd_send_msg(c, buf, buf[2] + 3, NEWCAMD_CLIENT_ID, 1) < 0) {
+    int rc;
+    {
+        std::lock_guard<SMutex> lock(conns_mutex);
+        rc = newcamd_send_msg(c, buf, buf[2] + 3, NEWCAMD_CLIENT_ID, 1);
+    }
+    if (rc < 0) {
         LOG("newcamd[%d]: failed to send LOGIN", c->idx);
         return;
     }
@@ -433,7 +455,12 @@ static void newcamd_send_login(SNewcamdConn *c) {
 
 static void newcamd_send_card_data_req(SNewcamdConn *c) {
     uint8_t buf[3] = {MSG_CARD_DATA_REQ, 0, 0};
-    if (newcamd_send_msg(c, buf, 3, 0, 0) < 0) {
+    int rc;
+    {
+        std::lock_guard<SMutex> lock(conns_mutex);
+        rc = newcamd_send_msg(c, buf, 3, 0, 0);
+    }
+    if (rc < 0) {
         LOG("newcamd[%d]: failed to send CARD_DATA_REQ", c->idx);
         return;
     }
@@ -456,6 +483,11 @@ static void newcamd_handle_card_data(SNewcamdConn *c, const uint8_t *payload,
         return;
     }
     uint16_t caid = ((uint16_t)payload[4] << 8) | payload[5];
+    if (caid == 0) {
+        LOG("newcamd[%d]: CARD_DATA reports caid=0, rejecting", c->idx);
+        newcamd_close_conn(c, "invalid caid");
+        return;
+    }
     int admin = payload[3];
     int nprov = (len > 11) ? payload[11] : 0;
     c->caid = caid;
@@ -530,6 +562,7 @@ static int newcamd_process_one(SNewcamdConn *c, uint8_t *wirebuf, int wirelen) {
             newcamd_handle_ecm_reply(c, msg_id, payload, plen);
         } else if (cmd == MSG_KEEPALIVE) {
             uint8_t ka[3] = {MSG_KEEPALIVE, 0, 0};
+            std::lock_guard<SMutex> lock(conns_mutex);
             newcamd_send_msg(c, ka, 3, 0, 0);
         } else {
             LOGM("newcamd[%d]: unhandled cmd %02X in READY", c->idx, cmd);
@@ -580,6 +613,10 @@ static int newcamd_sock_timeout(sockets *s) {
     SNewcamdConn *c = conn_for_sock(s->id);
     if (!c)
         return 0;
+    {
+        std::lock_guard<SMutex> lock(conns_mutex);
+        sweep_stale_pending(c);
+    }
     int64_t now = getTick();
     if (c->state >= NEWCAMD_STATE_READY && c->last_rx > 0 &&
         now - c->last_rx > NEWCAMD_DEAD_MS) {
@@ -736,8 +773,10 @@ static void free_pmt_key(SNewcamdPmtKey *k) {
     if (!k)
         return;
     if (k->filter_id >= 0) {
-        if (k->conn_idx >= 0 && k->conn_idx < nconns && conns[k->conn_idx])
+        if (k->conn_idx >= 0 && k->conn_idx < nconns && conns[k->conn_idx]) {
+            std::lock_guard<SMutex> lock(conns_mutex);
             clear_pending_for_filter(conns[k->conn_idx], k->filter_id);
+        }
         del_filter(k->filter_id);
     }
     for (int i = 0; i < MAX_NEWCAMD_PMT_KEYS; i++)
@@ -752,6 +791,9 @@ static int newcamd_ca_add_pmt(adapter *ad, SPMT *pmt) {
     if (nconns == 0)
         return TABLES_RESULT_ERROR_NORETRY;
 
+    // A PMT may list several CAIDs across providers; we pick the first one
+    // we have a configured reader for and wire up a single decode for it.
+    // pmt->opaque is a single slot, so it's one decode per PMT regardless.
     std::lock_guard<SMutex> lock(conns_mutex);
     for (int i = 0; i < pmt->caids; i++) {
         SPMTCA *ca = pmt->ca[i];
@@ -857,6 +899,10 @@ static void parse_one_endpoint(char *spec) {
 void parse_newcamd_opt(char *optarg) {
     // host:port:user:pass:deskey[,host:port:user:pass:deskey...]
     char buf[1024];
+    if (strlen(optarg) >= sizeof(buf))
+        LOG("newcamd: --newcamd / MINISAT_NEWCAMD truncated at %zu bytes; "
+            "trailing endpoint(s) may be dropped",
+            sizeof(buf) - 1);
     safe_strncpy(buf, optarg);
 
     char *p = buf;
