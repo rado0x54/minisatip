@@ -1,5 +1,5 @@
 /*
- * newcamd client for minisatip — see docs/NEWCAMD_PLAN.md
+ * newcamd client for minisatip.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License v2 or later.

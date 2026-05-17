@@ -6,12 +6,20 @@
 > [!IMPORTANT]
 > **About this fork**
 >
-> This is a fork of [catalinii/minisatip](https://github.com/catalinii/minisatip) that adds two capabilities on top of upstream:
+> This is a fork of [catalinii/minisatip](https://github.com/catalinii/minisatip) that adds three capabilities on top of upstream:
 >
 > - **Userspace USB DVB driver** — talks to supported USB DVB tuners (em28xx, dib0700, dvbsky bridges; e.g. WinTV-dualHD, MyGica T230C, Xbox One DTV Tuner) directly through [`dvb-libusb`](https://github.com/rado0x54/dvb-libusb), with no kernel DVB module required. Useful on macOS and on Linux systems whose stock kernel ships without DVB support (e.g. Synology DSM and other appliance NAS distributions). Also supports **USB hotplug** — devices plugged in or removed at runtime are auto-registered / torn down. Enable with `-DUSERSPACE_DVB=ON`.
 > - **HDHomeRun tuner emulation** — exposes minisatip's tuners over the SiliconDust HDHomeRun discovery + HTTP-streaming protocol, so HDHR-native clients (Plex, Channels, etc.) can use any backend minisatip supports. Enable with `-DHDHOMERUN=ON` and `-p PLAYLIST`.
+> - **newcamd descrambler client** — connects to oscam (or any newcamd-protocol cardserver) as a card-emulation client, instead of the dvbapi socket. Lets minisatip share a card with another process closer to the reader, and works against remote oscam instances over plain TCP. One TCP connection per CAID, learned at login. Enable with `-DNEWCAMD=ON` and use `--newcamd host:port:user:pass:deskey`. The flag is repeatable, and a single value may carry several comma-separated endpoints. To keep credentials off the process command line (visible via `ps`) put them in the `MINISAT_NEWCAMD` env var instead — minisatip reads it at startup using the same syntax:
 >
-> Releases on this fork include prebuilt Linux/macOS binaries with both features enabled. Everything else is upstream minisatip — the SAT>IP server, DVB-T/T2/C/S/S2/ATSC support, dvbapi/dvbca, web UI — and tracks the upstream branches.
+>   ```sh
+>   export MINISAT_NEWCAMD='127.0.0.1:15000:user:pass:0102030405060708091011121314,host2:15001:u2:p2:0203040506070809101112131415'
+>   minisatip   # no --newcamd flag needed
+>   ```
+>
+>   Env vars are protected from non-root users when minisatip runs as root (Linux `/proc/PID/environ` is mode 0400; `ps -E` on macOS is same-user only).
+>
+> Releases on this fork include prebuilt Linux/macOS binaries with all three features enabled. Everything else is upstream minisatip — the SAT>IP server, DVB-T/T2/C/S/S2/ATSC support, dvbapi/dvbca, web UI — and tracks the upstream branches.
 >
 > On macOS the easiest install is via Homebrew:
 >

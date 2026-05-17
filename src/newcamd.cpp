@@ -1,5 +1,5 @@
 /*
- * newcamd client for minisatip — see docs/NEWCAMD_PLAN.md
+ * newcamd client for minisatip.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License v2 or later.
@@ -41,7 +41,7 @@
 #define DEFAULT_LOG LOG_NEWCAMD
 
 #define NEWCAMD_DEFAULT_PORT 15050
-#define NEWCAMD_CONNECT_RETRY_MS 5000
+#define NEWCAMD_CONNECT_RETRY_MS 10000
 #define NEWCAMD_DEAD_MS 240000
 
 #define MSG_CLIENT_2_SERVER_LOGIN 0xE0
@@ -634,7 +634,8 @@ static int newcamd_connect_one(SNewcamdConn *c) {
     int64_t now = getTick();
     if (c->state != NEWCAMD_STATE_DISCONNECTED)
         return 0;
-    if (now - c->last_connect_attempt < NEWCAMD_CONNECT_RETRY_MS)
+    if (c->last_connect_attempt &&
+        now - c->last_connect_attempt < NEWCAMD_CONNECT_RETRY_MS)
         return 0;
     c->last_connect_attempt = now;
 
@@ -773,8 +774,6 @@ static int newcamd_ca_add_pmt(adapter *ad, SPMT *pmt) {
 
         uint8_t flt[FILTER_SIZE] = {0x80};
         uint8_t msk[FILTER_SIZE] = {0xFE};
-        // No FILTER_CRC: ECMs are DVB private sections; most CAS (Conax
-        // included) don't put a CRC32 at the end of the section.
         k->filter_id = add_filter_mask(ad->id, ca->pid, (void *)newcamd_ecm_cb,
                                         k, FILTER_ADD_REMOVE, flt, msk);
         if (k->filter_id < 0) {
@@ -813,19 +812,15 @@ static int newcamd_ca_init_dev(adapter *ad) {
 
 // ---------- CLI parsing & init ---------------------------------------------
 
-void parse_newcamd_opt(char *optarg) {
-    // host:port:user:pass:deskey
+static void parse_one_endpoint(char *spec) {
     if (nendpoints >= MAX_NEWCAMD_ENDPOINTS) {
-        LOG("newcamd: too many --newcamd entries (max %d)",
-            MAX_NEWCAMD_ENDPOINTS);
+        LOG("newcamd: too many endpoints (max %d)", MAX_NEWCAMD_ENDPOINTS);
         return;
     }
-    char buf[512];
-    safe_strncpy(buf, optarg);
 
     char *parts[5] = {NULL};
     int n = 0;
-    char *p = buf;
+    char *p = spec;
     while (n < 5 && p) {
         parts[n++] = p;
         char *colon = strchr(p, ':');
@@ -835,7 +830,7 @@ void parse_newcamd_opt(char *optarg) {
         p = colon + 1;
     }
     if (n < 5) {
-        LOG("newcamd: bad --newcamd arg; expected "
+        LOG("newcamd: bad endpoint spec; expected "
             "host:port:user:pass:deskey");
         return;
     }
@@ -859,7 +854,26 @@ void parse_newcamd_opt(char *optarg) {
     nendpoints++;
 }
 
+void parse_newcamd_opt(char *optarg) {
+    // host:port:user:pass:deskey[,host:port:user:pass:deskey...]
+    char buf[1024];
+    safe_strncpy(buf, optarg);
+
+    char *p = buf;
+    while (p && *p) {
+        char *comma = strchr(p, ',');
+        if (comma)
+            *comma = 0;
+        parse_one_endpoint(p);
+        p = comma ? comma + 1 : NULL;
+    }
+}
+
 void init_newcamd() {
+    char *envarg = getenv("MINISAT_NEWCAMD");
+    if (envarg && *envarg)
+        parse_newcamd_opt(envarg);
+
     if (nendpoints == 0)
         return;
 
