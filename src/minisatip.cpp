@@ -466,7 +466,7 @@ Help\n\
 #endif
 #ifndef DISABLE_NEWCAMD
         "\
-* --newcamd host:port:user:pass:deskey - connect to oscam via newcamd. Repeatable; a single value may carry several comma-separated endpoints. Each endpoint opens one TCP connection to one oscam newcamd reader (one port = one CAID, learned at login). deskey is the 28-hex-char DES key from oscam [newcamd] config.\n\
+* --newcamd host:port:user:pass:deskey - connect to a newcamd-compatible cardserver. Repeatable; a single value may carry several comma-separated endpoints. Each endpoint opens one TCP connection to one newcamd reader (one port = one CAID, learned at login). deskey is the 28-hex-char DES key from the cardserver's newcamd config.\n\
 	* eg: --newcamd 192.168.1.10:15050:user:pass:0102030405060708091011121314\n\
 	* Alternatively set MINISAT_NEWCAMD to the same string to keep credentials off the process command line (which is world-readable via ps).\n\
 \n\
