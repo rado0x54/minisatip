@@ -773,9 +773,10 @@ static int newcamd_ca_add_pmt(adapter *ad, SPMT *pmt) {
 
         uint8_t flt[FILTER_SIZE] = {0x80};
         uint8_t msk[FILTER_SIZE] = {0xFE};
+        // No FILTER_CRC: ECMs are DVB private sections; most CAS (Conax
+        // included) don't put a CRC32 at the end of the section.
         k->filter_id = add_filter_mask(ad->id, ca->pid, (void *)newcamd_ecm_cb,
-                                        k, FILTER_ADD_REMOVE | FILTER_CRC, flt,
-                                        msk);
+                                        k, FILTER_ADD_REMOVE, flt, msk);
         if (k->filter_id < 0) {
             free_pmt_key(k);
             return TABLES_RESULT_ERROR_NORETRY;
